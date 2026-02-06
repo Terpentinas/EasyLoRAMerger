@@ -1,7 +1,13 @@
 {
-  "name": "EasyLoRAMerger",
-  "author": "Terpentinas",
-  "description": "Simple LoRA merging node for ComfyUI",
-  "version": "0.1.0",
-  "url": "https://github.com/Terpentinas/EasyLoRAMerger"
+  "name": "Easy LoRA Merger (Experimental)",
+  "author": "YourName",
+  "version": "0.1.0-beta",
+  "project": "https://github.com/yourusername/EasyLoRAMerger",
+  "description": "Simple LoRA merger - started for Flux Klein, testing other formats",
+  "requirements": [],
+  "nodes": [
+    "EasyLoRAmerger",
+    "EasyLoRAonlyMerger"
+  ],
+  "tags": ["experimental", "lora", "merge", "flux", "klein"]
 }
