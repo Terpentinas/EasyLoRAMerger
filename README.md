@@ -24,7 +24,8 @@ A simple ComfyUI node that lets you **experiment with merging two LoRAs** using 
 
 | Format | Status | Notes |
 |--------|---------|-------|
-| **Flux Klein 4B/9B** | ✅ Tested | The main reason this exists! |
+| **Flux Klein 4B** | ✅ Tested | The main reason this exists! |
+| **Flux Klein 9B** | ✅ Seems OK | Tested with a few models |
 | **Z-Image Turbo (AI-Toolkit)** | ✅ Seems OK | Tested with a few models |
 | **Pony Diffusion** | ✅ Should work | Recent fix applied |
 | **SD1.5/SDXL Kohya** | ⚠️ Maybe | Not heavily tested |
