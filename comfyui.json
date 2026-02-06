@@ -1,6 +1,6 @@
 {
   "name": "Easy LoRA Merger (Experimental)",
-  "author": "YourName",
+  "author": "Terpentinas",
   "version": "0.1.0-beta",
   "project": "https://github.com/yourusername/EasyLoRAMerger",
   "description": "Simple LoRA merger - started for Flux Klein, testing other formats",
@@ -11,3 +11,4 @@
   ],
   "tags": ["experimental", "lora", "merge", "flux", "klein"]
 }
+
