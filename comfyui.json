@@ -1,0 +1,7 @@
+{
+  "name": "EasyLoRAMerger",
+  "author": "Terpentinas",
+  "description": "Simple LoRA merging node for ComfyUI",
+  "version": "0.1.0",
+  "url": "https://github.com/Terpentinas/EasyLoRAMerger"
+}
