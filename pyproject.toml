@@ -1,0 +1,17 @@
+[project]
+name = "comfyui-easy-lora-merger"
+description = "A simple tool for experimenting with LoRA merging, optimized for Flux Klein 4B/9B. Supports AI-Toolkit, X-Labs, and Kohya formats."
+version = "1.0.0"
+license = {text = "MIT"}
+authors = [
+    {name = "Terpentinas"}
+]
+readme = "README.md"
+
+[project.urls]
+Repository = "https://github.com/Terpentinas/EasyLoRAMerger"
+
+[tool.comfyui]
+display_name = "Easy LoRA Merger"
+author = "Terpentinas"
+category = "model_merging/lora"
