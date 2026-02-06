@@ -1,4 +1,5 @@
 # Easy LoRA Merger requirements
 # These are usually included with ComfyUI
-torch>=2.0.0
-safetensors>=0.4.0
+torch
+safetensors
+numpy
