@@ -1,7 +1,7 @@
 ## Two Simple Nodes
 
-- **Easy LoRA Merger**: Merge and immediately use
-- **Easy LoRA-Only Merger**: Merge and save as LoRA file
+- **Easy LoRA Merger**: Merge and preview
+- **Easy LoRA-Only Merger**: Merge for chaining
 
 ## Quick Start
 
