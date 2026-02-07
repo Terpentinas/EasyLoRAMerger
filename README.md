@@ -39,6 +39,6 @@ A simple ComfyUI node that lets you **experiment with merging two LoRAs** using 
    cd ComfyUI/custom_nodes
    git clone https://github.com/Terpentinas/EasyLoRAMerger
 
-- [Quick Start Guide](Quick Start Guide.md)
+- [Quick Start Guide](Quick_Start_Guide.md)
 
 ![Easy LoRA Merger](https://raw.githubusercontent.com/Terpentinas/EasyLoRAMerger/refs/heads/main/images/node.jpg)
