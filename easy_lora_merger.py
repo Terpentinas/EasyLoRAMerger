@@ -588,14 +588,7 @@ def get_experiment_temp_path(node_type: str = "main") -> Path:
 
 def get_user_output_path(save_folder: str, filename: str) -> Path:
     """
-    Get user output path with auto-increment and security validation.
-    
-    Args:
-        save_folder: User-provided save folder
-        filename: Base filename
-        
-    Returns:
-        Safe output Path
+    Get user output path with auto-increment.
     """
     # Default filename
     if not filename or filename.strip() == "":
@@ -605,43 +598,77 @@ def get_user_output_path(save_folder: str, filename: str) -> Path:
     if not filename.endswith(".safetensors"):
         filename += ".safetensors"
     
-    # Get base output folder (LORA directory or current)
+    # Clean filename
+    safe_filename = ''.join(c for c in filename 
+                           if c.isalnum() or c in '._- ').rstrip()
+    
+    # Get base output directory (default fallback)
     lora_folders = folder_paths.get_folder_paths("loras")
     default_base = Path(lora_folders[0]) if lora_folders else Path.cwd()
     
-    # Sanitize user-provided folder
+    # If user provided a save folder
     if save_folder and isinstance(save_folder, str) and save_folder.strip():
-        try:
-            output_folder = sanitize_path(save_folder.strip(), default_base)
-        except SecurityError as e:
-            print(f"⚠️ Security warning: {e}, using default folder")
-            output_folder = default_base
+        user_path = save_folder.strip()
+        
+        print(f"📁 User requested save folder: '{user_path}'")
+        
+        # Check if it looks like an absolute Windows path
+        is_windows_absolute = (len(user_path) >= 2 and 
+                              user_path[1] == ':' and 
+                              user_path[2] == '\\')
+        
+        # Check if it looks like a network path
+        is_network_path = user_path.startswith('\\\\')
+        
+        if is_windows_absolute or is_network_path:
+            # Absolute path - use it directly
+            try:
+                output_folder = Path(user_path)
+                
+                # Basic security: check for obvious path traversal
+                if '..' in user_path or user_path.count(':\\') > 1:
+                    print(f"⚠️ Suspicious path pattern, using default")
+                    output_folder = default_base
+                else:
+                    # Create directory if it doesn't exist
+                    output_folder.mkdir(parents=True, exist_ok=True)
+                    print(f"✅ Using absolute path: {output_folder}")
+            except Exception as e:
+                print(f"⚠️ Could not use absolute path '{user_path}': {e}")
+                output_folder = default_base
+        else:
+            # Relative path - treat as subfolder of default lora folder
+            try:
+                # Remove any leading/trailing slashes
+                clean_path = user_path.strip('\\/')
+                output_folder = default_base / clean_path
+                output_folder.mkdir(parents=True, exist_ok=True)
+                print(f"✅ Using relative path: {output_folder}")
+            except Exception as e:
+                print(f"⚠️ Could not create subfolder '{user_path}': {e}")
+                output_folder = default_base
     else:
+        # No custom folder specified
         output_folder = default_base
+        print(f"📁 Using default lora folder: {output_folder}")
     
-    # Create directory
-    output_folder.mkdir(parents=True, exist_ok=True)
+    # Create final path with auto-increment
+    base_path = output_folder / safe_filename
     
-    # Generate safe filename with auto-increment
-    original_path = output_folder / filename
-    
-    # Sanitize filename
-    safe_filename = ''.join(c for c in original_path.name 
-                           if c.isalnum() or c in '._- ').rstrip()
-    original_path = original_path.parent / safe_filename
-    
-    # Auto-increment if exists
+    # Auto-increment logic
     counter = 1
-    output_path = original_path
-    while output_path.exists():
-        stem = original_path.stem
-        # Remove existing counter suffix
-        if "_" in stem and stem.split("_")[-1].isdigit():
-            stem = "_".join(stem.split("_")[:-1])
-        output_path = original_path.parent / f"{stem}_{counter}{original_path.suffix}"
+    final_path = base_path
+    while final_path.exists():
+        stem = base_path.stem
+        # Remove existing counter
+        parts = stem.split('_')
+        if len(parts) > 1 and parts[-1].isdigit():
+            stem = '_'.join(parts[:-1])
+        final_path = base_path.parent / f"{stem}_{counter}{base_path.suffix}"
         counter += 1
     
-    return output_path
+    print(f"💾 Final save path: {final_path}")
+    return final_path
 
 def silent_pad_or_truncate(tensor: torch.Tensor, target_rank: int, key: str) -> torch.Tensor:
     """Silent version that doesn't print."""
@@ -1635,6 +1662,8 @@ class EasyLoRAmergerNode:
     FUNCTION = "merge"
     CATEGORY = "LoRA"
     
+    _CACHE = {}  # THIS LINE MUST EXIST AT CLASS LEVEL
+    
     @classmethod
     def IS_CHANGED(cls, **kwargs):
         """Cache implementation for ComfyUI change detection."""
@@ -1654,7 +1683,7 @@ class EasyLoRAmergerNode:
         key_str = str(cache_key).encode('utf-8')
         current_hash = hashlib.md5(key_str).hexdigest()
         
-        # Check cache
+        # Check cache - use cls._CACHE (class attribute)
         if cache_key in cls._CACHE and cls._CACHE[cache_key] == current_hash:
             return cls._CACHE[cache_key]
         
@@ -1788,13 +1817,16 @@ class EasyLoRAmergerNode:
         else:
             print(f"📁 Temp file will auto-cleanup (keeps last 10)")
         
-        print("="*50)
-        print("🎉 Done!")
-        print("="*50)
-        
-        # Clear cache if this was a save operation
+        # SAFE cache clearing - only if cache exists
         if save_trigger:
-            self._CACHE.clear()
+            try:
+                # Check if cache exists before clearing
+                if hasattr(EasyLoRAmergerNode, '_CACHE'):
+                    EasyLoRAmergerNode._CACHE.clear()
+                elif hasattr(self, '_CACHE'):
+                    self._CACHE.clear()
+            except:
+                pass  # Ignore cache errors - not critical
         
         return (model_lora, clip_lora, str(output_path))
 
