@@ -1,4 +1,5 @@
-# easy_lora_merger.py - SECURE & OPTIMIZED VERSION
+EASY_LORA_MERGER_VERSION = "1.1.0"
+EASY_LORA_MERGER_DATE = "2026-02-15"
 import warnings
 from pathlib import Path
 import time
@@ -21,13 +22,15 @@ import comfy.sd
 import comfy.utils
 
 from .methods import (
-    merge_linear, merge_ties_old, merge_ties_new, merge_dare_old, 
-    merge_dare_new, apply_density, merge_ties_gentle, merge_confidence_weighted,
-    merge_layer_selective, merge_svd_preserve, merge_noise_aware, merge_gradient_alignment
+    merge_linear, merge_ties_strict, merge_ties_gentle, merge_ties_gentle, merge_ties_gentle, merge_subtract, merge_magnitude, merge_feature_mix, merge_svd_preserve, merge_noise_aware, merge_gradient_alignment, apply_density, merge_dare_lite, merge_dare_rescale, universal_merge_executor
 )
 from .klein_normalizer import (
-    finalize_all_klein_keys, normalize_all_klein_formats, pad_or_truncate,
-    universal_normalize, universal_finalize, safe_get_rank, detect_lora_format
+    normalize_all_klein_formats, 
+    pad_or_truncate,
+    universal_normalize, 
+    universal_finalize, 
+    safe_get_rank, 
+    detect_lora_format
 )
 
 # Suppress warnings
@@ -56,15 +59,20 @@ class MergeConfig:
     density: float = 1.0
     weight_a: float = 1.0
     weight_b: float = 1.0
-    confidence_a: float = 0.5
-    confidence_b: float = 0.5
-    attn_weight: float = 1.0
-    mlp_weight: float = 0.7
+    confidence_a: float = 0.5  # Keep for backward compatibility
+    confidence_b: float = 0.5  # Keep for backward compatibility
+    attn_weight: float = 1.0    # Keep for backward compatibility
+    mlp_weight: float = 0.7     # Keep for backward compatibility
     device_type: Literal["auto", "cuda", "cpu"] = "auto"
     precision: Literal["auto", "float32", "bfloat16", "float16", "fp8"] = "auto"
     metadata_mode: Literal["none", "preserve_a", "preserve_b", "merge_basic"] = "merge_basic"
-    batch_size: int = 32  # For VRAM optimization
-    streaming: bool = True  # Stream tensors instead of loading all at once
+    batch_size: int = 32
+    streaming: bool = True
+    
+    # NEW ATTRIBUTES for new methods
+    uniqueness: float = 0.7      # For feature_mix
+    threshold: float = 0.0       # For subtract
+    blend: float = 0.5           # For magnitude
     
     @classmethod
     def from_inputs(cls, **kwargs) -> 'MergeConfig':
@@ -125,13 +133,13 @@ class MergeMethodRegistry:
 
 # In your easy_lora_merger.py, update the method registrations:
 MergeMethodRegistry.register("linear")(merge_linear)
-MergeMethodRegistry.register("ties_strict")(merge_ties_old)
+MergeMethodRegistry.register("ties_strict")(merge_ties_strict)
 MergeMethodRegistry.register("ties_gentle")(merge_ties_gentle)
-MergeMethodRegistry.register("ties_consensus")(merge_ties_old)  # Same as ties_strict
-MergeMethodRegistry.register("dare_lite")(merge_dare_old)
-MergeMethodRegistry.register("dare_rescale")(merge_dare_new)
-MergeMethodRegistry.register("confidence_weighted")(merge_confidence_weighted)
-MergeMethodRegistry.register("layer_selective")(merge_layer_selective)
+MergeMethodRegistry.register("dare_lite")(merge_dare_lite)
+MergeMethodRegistry.register("dare_rescale")(merge_dare_rescale)
+MergeMethodRegistry.register("subtract")(merge_subtract)  # NEW
+MergeMethodRegistry.register("magnitude")(merge_magnitude)  # NEW
+MergeMethodRegistry.register("feature_mix")(merge_feature_mix)  # NEW
 MergeMethodRegistry.register("svd_preserve")(merge_svd_preserve)
 MergeMethodRegistry.register("noise_aware")(merge_noise_aware)
 MergeMethodRegistry.register("gradient_alignment")(merge_gradient_alignment)
@@ -894,373 +902,11 @@ class MetadataMerger:
             print(f"📝 Resolved {len(conflicts)} metadata conflicts")
         
         return merged
-
-# ==================== STREAMING MERGE ENGINE ====================
-
-class StreamingMergeEngine:
-    """Performs memory-efficient streaming merges."""
-    
-    def __init__(self, config: MergeConfig):
-        self.config = config
-        self.device = DeviceManager.get_device(config.device_type)
-        self.dtype = DeviceManager.get_dtype(config.precision, self.device)
-        self.original_dtype = self.dtype  # Store original dtype for reference
-        
-        # Optimize device settings
-        if self.device.type == "cuda":
-            torch.backends.cudnn.benchmark = True
-            if torch.cuda.get_device_capability(self.device)[0] >= 8:
-                torch.backends.cuda.matmul.allow_tf32 = True
-        
-        print(f"💻 Device: {self.device}, Precision: {self.dtype}")
-    
-    def merge_with_streaming(self, path_a: Path, path_b: Path, 
-                            output_path: Path) -> Dict[str, torch.Tensor]:
-        """
-        Simplified merge function that works with all formats.
-        """
-        print("🔍 Loading LoRAs with streaming...")
-        
-        # First, let's load and normalize both models fully
-        # This is simpler than trying to stream with complex key mappings
-        
-        print("🔄 Loading and normalizing models...")
-        
-        # Load both models completely (they should fit in RAM)
-        with safe_open(path_a, framework="pt") as fa:
-            sd_a = {k: fa.get_tensor(k) for k in fa.keys()}
-        
-        with safe_open(path_b, framework="pt") as fb:
-            sd_b = {k: fb.get_tensor(k) for k in fb.keys()}
-        
-        # Normalize using the existing universal_normalize function
-        sd_a = universal_normalize(sd_a)
-        sd_b = universal_normalize(sd_b)
-        
-        print(f"📊 Normalized A: {len(sd_a)} keys, B: {len(sd_b)} keys")
-        
-        # Find common keys
-        keys_a = set(sd_a.keys())
-        keys_b = set(sd_b.keys())
-        common_keys = keys_a & keys_b
-        
-        print(f"🧩 Found {len(common_keys)} common layers to merge")
-        
-        if len(common_keys) == 0:
-            raise ValueError("No common layers found between the two LoRAs")
-        
-        # Process in batches
-        merged_dict = {}
-        keys_list = list(common_keys)
-        batch_size = self.config.batch_size
-        
-        # Create progress bar
-        try:
-            pbar = comfy.utils.ProgressBar(len(keys_list))
-        except:
-            pbar = None
-        
-        print("⚙️ Merging layers...")
-        
-        # Track dtype fallback status
-        current_dtype = self.dtype
-        dtype_changed = False
-        
-        for i in range(0, len(keys_list), batch_size):
-            batch_keys = keys_list[i:i + batch_size]
-            
-            for key in batch_keys:
-                try:
-                    # Try with current dtype
-                    try:
-                        t_a = sd_a[key].to(self.device).to(current_dtype)
-                        t_b = sd_b[key].to(self.device).to(current_dtype)
-                    except Exception as dtype_error:
-                        # dtype conversion failed, try fallback
-                        if not dtype_changed:
-                            current_dtype = DeviceManager.get_fallback_dtype(current_dtype)
-                            dtype_changed = True
-                            print(f"🔄 Changed dtype to {current_dtype} due to conversion error")
-                            t_a = sd_a[key].to(self.device).to(current_dtype)
-                            t_b = sd_b[key].to(self.device).to(current_dtype)
-                        else:
-                            # Already tried fallback, re-raise
-                            raise dtype_error
-                    
-                    # Rank adjustment
-                    rank_a = safe_get_rank(t_a, key)
-                    rank_b = safe_get_rank(t_b, key)
-                    target_rank = max(rank_a, rank_b)
-                    
-                    if rank_a != rank_b:
-                        t_a = silent_pad_or_truncate(t_a, target_rank, key)
-                        t_b = silent_pad_or_truncate(t_b, target_rank, key)
-                    
-                    # Get merge method
-                    merge_func = MergeMethodRegistry.get_method(self.config.method)
-                    
-                    # Prepare arguments - only pass confidence for methods that support it
-                    method_args = {
-                        'a': t_a, 'b': t_b, 
-                        'wa': self.config.weight_a, 'wb': self.config.weight_b
-                    }
-                    
-                    # Add method-specific parameters
-                    if self.config.method == "confidence_weighted":
-                        method_args['confidence_a'] = self.config.confidence_a
-                        method_args['confidence_b'] = self.config.confidence_b
-                    elif self.config.method in ["ties_strict", "ties_consensus"]:
-                        # ties_strict and ties_consensus use merge_ties_old
-                        # Don't pass confidence parameters to TIES methods
-                        pass
-                    elif self.config.method == "ties_gentle":
-                        method_args['agreement_threshold'] = 0.3  # Default value
-                    
-                    if self.config.method == "layer_selective":
-                        method_args['key'] = key
-                        method_args['attn_weight'] = self.config.attn_weight
-                        method_args['mlp_weight'] = self.config.mlp_weight
-                    
-                    if self.config.method == "svd_preserve":
-                        method_args['preserve_ratio'] = self.config.density
-                    
-                    if self.config.method == "noise_aware":
-                        method_args['noise_threshold'] = 0.01 * self.config.density
-                    
-                    if self.config.method == "dare_rescale":
-                        method_args['drop_rate'] = 1.0 - self.config.density
-                    
-                    # Try to merge
-                    try:
-                        merged = merge_func(**method_args)
-                    except Exception as merge_error:
-                        # If merge fails with current dtype, try fallback
-                        if not dtype_changed and "not implemented" in str(merge_error):
-                            current_dtype = DeviceManager.get_fallback_dtype(current_dtype)
-                            dtype_changed = True
-                            print(f"🔄 Changed dtype to {current_dtype} due to: {merge_error}")
-                            
-                            # Retry with new dtype
-                            t_a = sd_a[key].to(self.device).to(current_dtype)
-                            t_b = sd_b[key].to(self.device).to(current_dtype)
-                            
-                            # Reapply rank adjustment
-                            if rank_a != rank_b:
-                                t_a = silent_pad_or_truncate(t_a, target_rank, key)
-                                t_b = silent_pad_or_truncate(t_b, target_rank, key)
-                            
-                            # Update method args with new tensors
-                            method_args['a'] = t_a
-                            method_args['b'] = t_b
-                            
-                            merged = merge_func(**method_args)
-                        else:
-                            # Already tried fallback or different error
-                            raise merge_error
-                    
-                    # Apply density if needed
-                    if "dare" not in self.config.method and self.config.density < 1.0:
-                        merged = apply_density(merged, self.config.density)
-                    
-                    # Store result
-                    merged_dict[key] = merged.cpu()
-                    
-                    # Cleanup
-                    del t_a, t_b, merged
-                    
-                except Exception as e:
-                    print(f"⚠️ Failed to merge {key}: {e}")
-                    import traceback
-                    traceback.print_exc()
-            
-            # Update progress
-            if pbar:
-                pbar.update(min(batch_size, len(keys_list) - i))
-            
-            # Clean GPU memory
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            # Yield for UI
-            time.sleep(0.001)
-        
-        # Add unique keys with current dtype
-        unique_keys_a = keys_a - keys_b
-        unique_keys_b = keys_b - keys_a
-        
-        if unique_keys_a:
-            print(f"📝 Adding {len(unique_keys_a)} unique keys from A")
-            for key in unique_keys_a:
-                try:
-                    tensor = sd_a[key].to(self.device).to(current_dtype) * self.config.weight_a
-                    if self.config.density < 1.0 and "dare" not in self.config.method:
-                        tensor = apply_density(tensor, self.config.density)
-                    merged_dict[key] = tensor.cpu()
-                except Exception as e:
-                    print(f"⚠️ Failed to add unique key {key}: {e}")
-        
-        if unique_keys_b:
-            print(f"📝 Adding {len(unique_keys_b)} unique keys from B")
-            for key in unique_keys_b:
-                try:
-                    tensor = sd_b[key].to(self.device).to(current_dtype) * self.config.weight_b
-                    if self.config.density < 1.0 and "dare" not in self.config.method:
-                        tensor = apply_density(tensor, self.config.density)
-                    merged_dict[key] = tensor.cpu()
-                except Exception as e:
-                    print(f"⚠️ Failed to add unique key {key}: {e}")
-        
-        if dtype_changed:
-            print(f"📊 Final dtype used: {current_dtype} (originally requested {self.original_dtype})")
-        
-        print(f"✅ Merged {len(merged_dict)} total keys")
-        return merged_dict
-
-    
-    def _process_batches(self, common_keys: Set[str], 
-                        norm_to_orig_a: Dict[str, str], norm_to_orig_b: Dict[str, str],
-                        fa, fb) -> Dict[str, torch.Tensor]:
-        """Process keys in batches to optimize VRAM usage."""
-        merged_dict = {}
-        keys_list = list(common_keys)
-        batch_size = self.config.batch_size
-        
-        # Create progress bar for ComfyUI
-        try:
-            pbar = comfy.utils.ProgressBar(len(keys_list))
-        except:
-            pbar = None
-        
-        for i in range(0, len(keys_list), batch_size):
-            batch_keys = keys_list[i:i + batch_size]
-            batch_results = {}
-            
-            for norm_key in batch_keys:
-                try:
-                    # Get original keys
-                    orig_key_a = norm_to_orig_a.get(norm_key)
-                    orig_key_b = norm_to_orig_b.get(norm_key)
-                    
-                    if not orig_key_a or not orig_key_b:
-                        print(f"⚠️ Key mapping missing for {norm_key}, skipping")
-                        continue
-                    
-                    # Load tensors
-                    with torch.no_grad():
-                        t_a = fa.get_tensor(orig_key_a).to(self.device).to(self.dtype)
-                        t_b = fb.get_tensor(orig_key_b).to(self.device).to(self.dtype)
-                    
-                    # Debug output for first few keys
-                    if i == 0 and len(batch_results) < 3:
-                        print(f"   Merging: {orig_key_a[:50]}...")
-                        print(f"     Shape A: {t_a.shape}, B: {t_b.shape}")
-                    
-                    # Rank adjustment
-                    rank_a = safe_get_rank(t_a, norm_key)
-                    rank_b = safe_get_rank(t_b, norm_key)
-                    target_rank = max(rank_a, rank_b)
-                    
-                    if rank_a != rank_b:
-                        print(f"   Rank adjustment: {rank_a} -> {target_rank} for {norm_key[:40]}...")
-                    
-                    t_a = silent_pad_or_truncate(t_a, target_rank, norm_key)
-                    t_b = silent_pad_or_truncate(t_b, target_rank, norm_key)
-                    
-                    # Get merge method and merge
-                    merge_func = MergeMethodRegistry.get_method(self.config.method)
-                    
-                    # Prepare method-specific arguments
-                    method_args = {
-                        'a': t_a, 'b': t_b, 
-                        'wa': self.config.weight_a, 'wb': self.config.weight_b
-                    }
-                    
-                    if self.config.method in ["confidence_weighted", "ties_strict", 
-                                            "ties_gentle", "ties_consensus"]:
-                        method_args['confidence_a'] = self.config.confidence_a
-                        method_args['confidence_b'] = self.config.confidence_b
-                    
-                    if self.config.method == "layer_selective":
-                        method_args['key'] = norm_key
-                        method_args['attn_weight'] = self.config.attn_weight
-                        method_args['mlp_weight'] = self.config.mlp_weight
-                    
-                    if self.config.method == "svd_preserve":
-                        method_args['preserve_ratio'] = self.config.density
-                    
-                    if self.config.method == "noise_aware":
-                        method_args['noise_threshold'] = 0.01 * self.config.density
-                    
-                    # Special handling for dare_rescale
-                    if self.config.method == "dare_rescale":
-                        drop_rate = 1.0 - self.config.density
-                        method_args['drop_rate'] = drop_rate
-                    
-                    # Apply merge
-                    merged = merge_func(**method_args)
-                    
-                    # Apply density if needed (for non-DARE methods)
-                    if "dare" not in self.config.method and self.config.density < 1.0:
-                        merged = apply_density(merged, self.config.density)
-                    
-                    # Store result (use normalized key pattern)
-                    # For Flux models, we need to use a consistent naming pattern
-                    result_key = norm_key
-                    batch_results[result_key] = merged.cpu()
-                    
-                    # Clean up GPU memory
-                    del t_a, t_b, merged
-                    
-                except Exception as e:
-                    print(f"⚠️ Failed to merge {norm_key}: {e}")
-                    import traceback
-                    traceback.print_exc()
-            
-            # Update main dict and clean up
-            merged_dict.update(batch_results)
-            batch_results.clear()
-            
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            # Update progress
-            if pbar:
-                pbar.update(min(batch_size, len(keys_list) - i))
-            
-            # Yield to keep ComfyUI responsive
-            if i % (batch_size * 2) == 0:
-                comfyui_yield()
-        
-        return merged_dict
-    
-    def _process_all(self, common_keys: Set[str], 
-                    norm_to_orig_a: Dict[str, str], norm_to_orig_b: Dict[str, str],
-                    fa, fb) -> Dict[str, torch.Tensor]:
-        """Process all keys at once (for debugging)."""
-        merged_dict = {}
-        
-        for norm_key in common_keys:
-            orig_key_a = norm_to_orig_a.get(norm_key)
-            orig_key_b = norm_to_orig_b.get(norm_key)
-            
-            if not orig_key_a or not orig_key_b:
-                continue
-            
-            t_a = fa.get_tensor(orig_key_a)
-            t_b = fb.get_tensor(orig_key_b)
-            
-            # Use original merge logic as fallback
-            t_a = t_a.to(self.device).to(self.dtype)
-            t_b = t_b.to(self.device).to(self.dtype)
-            
-            # Simple linear merge for debugging
-            merged = merge_linear(t_a, t_b, self.config.weight_a, self.config.weight_b)
-            merged_dict[norm_key] = merged.cpu()
-        
-        return merged_dict
     
 # ==================== SIMPLIFIED STREAMING MERGE ENGINE ====================
 
+# In easy_lora_merger.py, update the StreamingMergeEngine class:
+
 class StreamingMergeEngine:
     """Performs memory-efficient streaming merges."""
     
@@ -1277,16 +923,45 @@ class StreamingMergeEngine:
         
         print(f"💻 Device: {self.device}, Precision: {self.dtype}")
     
+    def _detect_converted_lora(self, sd, original_sd):
+        """Detect if a LoRA is already converted (alpha baked in)"""
+        # Method 1: Check for alpha keys in original
+        has_alpha = any('.alpha' in k for k in original_sd.keys())
+        
+        # Method 2: Check key count ratio (unconverted have ~1.5x more keys)
+        key_count = len(sd)
+        
+        # Unconverted Musubi patterns:
+        # - 4B: ~240 keys unconverted, ~160 converted
+        # - 9B: ~336 keys unconverted, ~224 converted
+        # - Z-image: ~630 keys unconverted, ~420 converted
+        
+        # If it has alpha keys AND high key count, it's unconverted
+        if has_alpha and key_count > 200:
+            # Check if it's in the unconverted range
+            if (220 <= key_count <= 260) or (320 <= key_count <= 350) or (600 <= key_count <= 650):
+                print(f"   📊 Detected unconverted LoRA ({key_count} keys, has alphas)")
+                return False
+        
+        # If no alpha keys, it's definitely converted
+        if not has_alpha:
+            print(f"   📊 Detected converted LoRA (no alpha keys)")
+            return True
+        
+        # Default: assume converted if uncertain
+        print(f"   📊 LoRA status uncertain ({key_count} keys, has_alphas={has_alpha}) - assuming converted")
+        return True
+    
+    
     def merge_with_streaming(self, path_a: Path, path_b: Path, 
                             output_path: Path) -> Dict[str, torch.Tensor]:
         """
         Simplified merge function that works with all formats.
+        Includes alpha scaling to ensure sliders work correctly.
         """
         print("🔍 Loading LoRAs with streaming...")
         
         # First, let's load and normalize both models fully
-        # This is simpler than trying to stream with complex key mappings
-        
         print("🔄 Loading and normalizing models...")
         
         # Load both models completely (they should fit in RAM)
@@ -1296,18 +971,106 @@ class StreamingMergeEngine:
         with safe_open(path_b, framework="pt") as fb:
             sd_b = {k: fb.get_tensor(k) for k in fb.keys()}
         
+        # Store original state dicts for alpha lookups
+        original_sd_a = dict(sd_a)  # Keep original for alpha keys
+        original_sd_b = dict(sd_b)
+        
         # Normalize using the existing universal_normalize function
         sd_a = universal_normalize(sd_a)
         sd_b = universal_normalize(sd_b)
         
         print(f"📊 Normalized A: {len(sd_a)} keys, B: {len(sd_b)} keys")
         
+        # Detect Z-Image architectures
+        def detect_zimage_architecture(sd, name):
+            keys = list(sd.keys())
+            key_count = len(sd)
+            
+            # Musubi-tuner (630 keys, has alphas)
+            if key_count >= 600 and any('lora_unet_layers' in k for k in keys):
+                return f"{name}: Z-Image (Musubi-tuner)"
+            
+            # AI Toolkit (480 keys, no alphas)  
+            elif key_count >= 450 and any('adaLN_modulation' in k for k in keys):
+                return f"{name}: Z-Image Base (AI Toolkit)"
+            elif key_count >= 450:
+                # Without adaLN, it might be Turbo
+                return f"{name}: Z-Image Turbo (AI Toolkit)"
+            
+            elif any('double_blocks' in k for k in keys):
+                return f"{name}: Flux/Klein"
+            else:
+                return f"{name}: Unknown"
+        
+        arch_a = detect_zimage_architecture(sd_a, "A")
+        arch_b = detect_zimage_architecture(sd_b, "B")
+        print(f"🏗️ {arch_a}")
+        print(f"🏗️ {arch_b}")
+ 
+        # --- ADD MODEL TYPE DETECTION ---
+        def detect_model_type(sd):
+            """Detect which base model this LoRA was trained for"""
+            shapes = []
+            # Check first 20 relevant keys
+            for key in list(sd.keys())[:20]:
+                if any(x in key for x in ['linear1', 'linear2', 'img_attn.qkv']):
+                    tensor = sd[key]
+                    if len(tensor.shape) >= 2:
+                        shapes.append((tensor.shape[0], tensor.shape[1]))
+            
+            if not shapes:
+                return "unknown"
+            
+            avg_in = sum(s[0] for s in shapes) / len(shapes)
+            avg_out = sum(s[1] for s in shapes) / len(shapes)
+            
+            # Flux 9B standard
+            if abs(avg_in - 4096) < 100 and abs(avg_out - 36864) < 1000:
+                return "flux_9b_standard"
+            # Flux 2 Dev (what you just saw)
+            elif abs(avg_in - 6144) < 100 and abs(avg_out - 24576) < 1000:
+                return "flux_2_dev"
+            # Z-Image
+            elif abs(avg_in - 3840) < 100 and abs(avg_out - 10240) < 1000:
+                return "z_image"
+            # SDXL range
+            elif avg_in > 2000 and avg_in < 3000 and avg_out > 2000 and avg_out < 3000:
+                return "sdxl"
+            # flux_2_dev range
+            elif abs(avg_in - 9232) < 100 and abs(avg_out - 3088) < 100:
+                return "flux_2_dev"
+            else:
+                return f"unknown_{int(avg_in)}x{int(avg_out)}"
+        
+        model_a = detect_model_type(sd_a)
+        model_b = detect_model_type(sd_b)
+        print(f"📐 Model A: {model_a}")
+        print(f"📐 Model B: {model_b}")
+        
+        if model_a != model_b and "unknown" not in model_a and "unknown" not in model_b:
+            print(f"⚠️ WARNING: LoRAs trained for different models!")
+            print(f"   A: {model_a}")
+            print(f"   B: {model_b}")
+            print(f"   Merge will work but may not load correctly in your model")
+ 
+        # --- END OF BLOCK ---
+
+        print("🔍 Detecting LoRA conversion status...")
+        sd_a_converted = self._detect_converted_lora(sd_a, original_sd_a)
+        sd_b_converted = self._detect_converted_lora(sd_b, original_sd_b)
+        print(f"📊 LoRA A converted: {sd_a_converted}, LoRA B converted: {sd_b_converted}")
+
         # Find common keys
         keys_a = set(sd_a.keys())
         keys_b = set(sd_b.keys())
         common_keys = keys_a & keys_b
         
+        # Calculate unique keys before using them
+        unique_keys_a = keys_a - keys_b
+        unique_keys_b = keys_b - keys_a
+        
         print(f"🧩 Found {len(common_keys)} common layers to merge")
+        print(f"📝 Unique to A: {len(unique_keys_a)}, Unique to B: {len(unique_keys_b)}")
         
         if len(common_keys) == 0:
             raise ValueError("No common layers found between the two LoRAs")
@@ -1325,16 +1088,95 @@ class StreamingMergeEngine:
         
         print("⚙️ Merging layers...")
         
+        # --- HELPER FUNCTION FOR ALPHA SCALING ---
+        def apply_lora_scaling(tensor, original_sd, key, is_converted=False):
+            """Apply alpha/rank scaling correction to LoRA tensors"""
+            
+            # For converted LoRAs (no alpha keys), don't scale
+            if is_converted:
+                return tensor
+            
+            # Store original stats for debug
+            orig_mean = tensor.abs().mean().item()
+            
+            # Try multiple alpha key patterns
+            alpha_key_candidates = [
+                key.replace(".weight", ".alpha"),
+                key.replace("lora_A.weight", "alpha"),
+                key.replace("lora_B.weight", "alpha"),
+                key.replace("lora_down.weight", "alpha"),
+                key.replace("lora_up.weight", "alpha"),
+                key.replace("diffusion_model.", "").replace(".lora_A.weight", ".alpha"),
+                key.replace("diffusion_model.", "").replace(".lora_B.weight", ".alpha"),
+            ]
+            
+            # Also try with the base layer name
+            if '.lora_' in key:
+                base_key = key.split('.lora_')[0]
+                alpha_key_candidates.append(f"{base_key}.alpha")
+                alpha_key_candidates.append(f"{base_key}_alpha")
+            
+            alpha_value = None
+            alpha_key_used = None
+            for alpha_key in alpha_key_candidates:
+                if alpha_key in original_sd:
+                    try:
+                        alpha_tensor = original_sd[alpha_key]
+                        if isinstance(alpha_tensor, torch.Tensor):
+                            if alpha_tensor.numel() == 1:
+                                alpha_value = alpha_tensor.item()
+                            else:
+                                alpha_value = alpha_tensor.mean().item()
+                            alpha_key_used = alpha_key
+                            break
+                    except:
+                        continue
+            
+            if alpha_value is not None:
+                alpha_value = abs(alpha_value)
+                
+                if len(tensor.shape) >= 2:
+                    rank = min(tensor.shape[0], tensor.shape[1])
+                else:
+                    rank = 1
+                
+                rank = max(1, rank)
+                scale_factor = alpha_value / rank
+                
+                # Check if this is a converted LoRA (alpha should be baked in)
+                # If scale_factor is very small, it might be incorrectly applied
+                if scale_factor < 0.01 and alpha_value < 1.0:
+                    print(f"⚠️ Very small scale factor {scale_factor:.6f} for {key}")
+                    print(f"   alpha={alpha_value:.4f}, rank={rank}")
+                    print(f"   This LoRA may already be converted - using raw tensor")
+                    return tensor  # Return unscaled for converted LoRAs
+                
+                # For valid scaling factors, apply
+                if scale_factor > 0.01:
+                    return tensor * scale_factor
+                else:
+                    # Too small, probably shouldn't scale
+                    return tensor
+            
+            # No alpha found - this is a converted LoRA
+            return tensor
+        
+        
         for i in range(0, len(keys_list), batch_size):
             batch_keys = keys_list[i:i + batch_size]
             
             for key in batch_keys:
                 try:
-                    # Get tensors
-                    t_a = sd_a[key].to(self.device).to(self.dtype)
-                    t_b = sd_b[key].to(self.device).to(self.dtype)
+                    # Get base tensors
+                    raw_a = sd_a[key].to(self.device).to(self.dtype)
+                    raw_b = sd_b[key].to(self.device).to(self.dtype)
                     
-                    # Rank adjustment
+                    # --- APPLY ALPHA SCALING FIRST (CRITICAL FOR SLIDER ACCURACY) ---
+                    # This ensures both LoRAs are at the same "volume" before merging
+                    t_a = apply_lora_scaling(raw_a, original_sd_a, key, is_converted=sd_a_converted)
+                    t_b = apply_lora_scaling(raw_b, original_sd_b, key, is_converted=sd_b_converted)
+                    
+                    # --- THEN DO RANK ADJUSTMENT ---
                     rank_a = safe_get_rank(t_a, key)
                     rank_b = safe_get_rank(t_b, key)
                     target_rank = max(rank_a, rank_b)
@@ -1343,50 +1185,128 @@ class StreamingMergeEngine:
                         t_a = silent_pad_or_truncate(t_a, target_rank, key)
                         t_b = silent_pad_or_truncate(t_b, target_rank, key)
                     
+                    # --- DEBUG INFO FOR FIRST FEW LAYERS ---
+                    if i == 0 and len(batch_keys) > 0 and key in batch_keys[:2]:
+                        # Choose a good sample key (prefer lora_A over lora_B)
+                        sample_key = key
+                        if 'lora_B' in key:
+                            # Try to find corresponding A weight
+                            a_key = key.replace('lora_B', 'lora_A')
+                            if a_key in sd_a:
+                                sample_key = a_key
+                        
+                        # Get stats on the SCALED tensors
+                        a_stats = {
+                            'mean': t_a.abs().mean().item(),
+                            'std': t_a.std().item(),
+                            'max': t_a.abs().max().item(),
+                            'min': t_a.abs().min().item(),
+                            'non_zero': (t_a != 0).float().mean().item() * 100
+                        }
+                        b_stats = {
+                            'mean': t_b.abs().mean().item(),
+                            'std': t_b.std().item(),
+                            'max': t_b.abs().max().item(),
+                            'min': t_b.abs().min().item(),
+                            'non_zero': (t_b != 0).float().mean().item() * 100
+                        }
+                        
+                        print(f"\n📊 Sample Layer: {sample_key}")
+                        print(f"   LoRA A - mean: {a_stats['mean']:.6f}, max: {a_stats['max']:.6f}, non-zero: {a_stats['non_zero']:.1f}%")
+                        print(f"   LoRA B - mean: {b_stats['mean']:.6f}, max: {b_stats['max']:.6f}, non-zero: {b_stats['non_zero']:.1f}%")
+                        
+                        # Show slider values
+                        if self.config.method == "feature_mix":
+                            print(f"   🔧 uniqueness={self.config.uniqueness}")
+                        elif self.config.method == "subtract":
+                            print(f"   🔧 threshold={self.config.threshold}")
+                        elif self.config.method == "magnitude":
+                            print(f"   🔧 blend={self.config.blend}")
+                        
+                        # Also show raw (unscaled) stats for comparison
+                        if 'raw_a' in locals() and 'raw_b' in locals():
+                            raw_a_mean = raw_a.abs().mean().item()
+                            raw_b_mean = raw_b.abs().mean().item()
+                            print(f"   Raw (unscaled) - A: {raw_a_mean:.6f}, B: {raw_b_mean:.6f}")
+                            
+                            # Calculate scaling effect
+                            if raw_a_mean > 0:
+                                scale_a = a_stats['mean'] / raw_a_mean
+                                print(f"   Scaling factor A: {scale_a:.3f}")
+                            if raw_b_mean > 0:
+                                scale_b = b_stats['mean'] / raw_b_mean
+                                print(f"   Scaling factor B: {scale_b:.3f}")
+                    
+                    # --- END DEBUG INFO ---
+                    
                     # Get merge method
                     merge_func = MergeMethodRegistry.get_method(self.config.method)
                     
-                    # Prepare arguments
+                    # Prepare arguments with SCALED tensors
                     method_args = {
                         'a': t_a, 'b': t_b, 
                         'wa': self.config.weight_a, 'wb': self.config.weight_b
                     }
                     
-                    # Add method-specific parameters
-                    if self.config.method in ["confidence_weighted", "ties_strict", 
-                                            "ties_gentle", "ties_consensus"]:
-                        method_args['confidence_a'] = self.config.confidence_a
-                        method_args['confidence_b'] = self.config.confidence_b
-                    
-                    if self.config.method == "layer_selective":
-                        method_args['key'] = key
-                        method_args['attn_weight'] = self.config.attn_weight
-                        method_args['mlp_weight'] = self.config.mlp_weight
-                    
-                    if self.config.method == "svd_preserve":
+                    # Add method-specific parameters from self.config
+                    if self.config.method == "subtract":
+                        method_args['threshold'] = self.config.threshold
+                    elif self.config.method == "magnitude":
+                        method_args['blend'] = self.config.blend
+                    elif self.config.method == "feature_mix":
+                        method_args['uniqueness'] = self.config.uniqueness
+                    elif self.config.method == "svd_preserve":
                         method_args['preserve_ratio'] = self.config.density
-                    
-                    if self.config.method == "noise_aware":
+                    elif self.config.method == "noise_aware":
                         method_args['noise_threshold'] = 0.01 * self.config.density
-                    
-                    if self.config.method == "dare_rescale":
+                    elif self.config.method == "dare_rescale":
                         method_args['drop_rate'] = 1.0 - self.config.density
+                    elif self.config.method == "ties_gentle":
+                        method_args['agreement_threshold'] = 0.3
+                    
+                    # --- ADDITIONAL SCALING CORRECTION (if needed) ---
+                    # This handles dimension mismatches
+                    if t_a.shape != t_b.shape:
+                        scale_correction = max(t_a.shape[-1], t_b.shape[-1]) / min(t_a.shape[-1], t_b.shape[-1])
+                        if t_a.numel() < t_b.numel():
+                            method_args['wa'] *= scale_correction
+                        else:
+                            method_args['wb'] *= scale_correction
                     
                     # Merge
-                    merged = merge_func(**method_args)
+                    # Extract weights properly
+                    wa_final = method_args.pop('wa')
+                    wb_final = method_args.pop('wb')
+                    a_tensor = method_args.pop('a')
+                    b_tensor = method_args.pop('b')
+                    
+                    # Use universal_merge_executor for safety with shape mismatches
+                    from .methods import universal_merge_executor
+                    
+                    merged = universal_merge_executor(
+                        merge_func, 
+                        a_tensor, 
+                        b_tensor, 
+                        wa_final, 
+                        wb_final, 
+                        **method_args
+                    )
                     
                     # Apply density if needed
                     if "dare" not in self.config.method and self.config.density < 1.0:
                         merged = apply_density(merged, self.config.density)
-                    
+
+
                     # Store result
                     merged_dict[key] = merged.cpu()
                     
                     # Cleanup
-                    del t_a, t_b, merged
+                    del raw_a, raw_b, t_a, t_b, merged
                     
                 except Exception as e:
                     print(f"⚠️ Failed to merge {key}: {e}")
+                    import traceback
+                    traceback.print_exc()
             
             # Update progress
             if pbar:
@@ -1398,17 +1318,19 @@ class StreamingMergeEngine:
             
             # Yield for UI
             if i % (batch_size * 4) == 0:
-                comfyui_yield()
+                try:
+                    comfyui_yield()
+                except:
+                    pass
         
-        # Add unique keys
-        unique_keys_a = keys_a - keys_b
-        unique_keys_b = keys_b - keys_a
-        
+        # Add unique keys (with scaling applied)
         if unique_keys_a:
             print(f"📝 Adding {len(unique_keys_a)} unique keys from A")
             for key in unique_keys_a:
                 try:
-                    tensor = sd_a[key].to(self.device).to(self.dtype) * self.config.weight_a
+                    raw_tensor = sd_a[key].to(self.device).to(self.dtype)
+                    # Apply scaling to unique keys too
+                    tensor = apply_lora_scaling(raw_tensor, original_sd_a, key) * self.config.weight_a
                     if self.config.density < 1.0 and "dare" not in self.config.method:
                         tensor = apply_density(tensor, self.config.density)
                     merged_dict[key] = tensor.cpu()
@@ -1419,7 +1341,9 @@ class StreamingMergeEngine:
             print(f"📝 Adding {len(unique_keys_b)} unique keys from B")
             for key in unique_keys_b:
                 try:
-                    tensor = sd_b[key].to(self.device).to(self.dtype) * self.config.weight_b
+                    raw_tensor = sd_b[key].to(self.device).to(self.dtype)
+                    # Apply scaling to unique keys too
+                    tensor = apply_lora_scaling(raw_tensor, original_sd_b, key) * self.config.weight_b
                     if self.config.density < 1.0 and "dare" not in self.config.method:
                         tensor = apply_density(tensor, self.config.density)
                     merged_dict[key] = tensor.cpu()
@@ -1428,31 +1352,31 @@ class StreamingMergeEngine:
         
         print(f"✅ Merged {len(merged_dict)} total keys")
         return merged_dict
-    
-    def _merge_single(self, t_a: torch.Tensor, t_b: torch.Tensor, key: str) -> torch.Tensor:
-        """Merge single tensor pair."""
-        t_a = t_a.to(self.device).to(self.dtype)
-        t_b = t_b.to(self.device).to(self.dtype)
         
-        # Rank adjustment
-        rank_a = safe_get_rank(t_a, key)
-        rank_b = safe_get_rank(t_b, key)
-        target_rank = max(rank_a, rank_b)
-        
-        t_a = silent_pad_or_truncate(t_a, target_rank, key)
-        t_b = silent_pad_or_truncate(t_b, target_rank, key)
-        
-        # Merge (simplified version)
-        if self.config.method == "linear":
-            merged = merge_linear(t_a, t_b, self.config.weight_a, self.config.weight_b)
-        # ... other methods ...
-        else:
-            merged = merge_linear(t_a, t_b, self.config.weight_a, self.config.weight_b)
-        
-        if "dare" not in self.config.method and self.config.density < 1.0:
-            merged = apply_density(merged, self.config.density)
-        
-        return merged
+        def _merge_single(self, t_a: torch.Tensor, t_b: torch.Tensor, key: str) -> torch.Tensor:
+            """Merge single tensor pair."""
+            t_a = t_a.to(self.device).to(self.dtype)
+            t_b = t_b.to(self.device).to(self.dtype)
+            
+            # Rank adjustment
+            rank_a = safe_get_rank(t_a, key)
+            rank_b = safe_get_rank(t_b, key)
+            target_rank = max(rank_a, rank_b)
+            
+            t_a = silent_pad_or_truncate(t_a, target_rank, key)
+            t_b = silent_pad_or_truncate(t_b, target_rank, key)
+            
+            # Merge (simplified version)
+            if self.config.method == "linear":
+                merged = merge_linear(t_a, t_b, self.config.weight_a, self.config.weight_b)
+            # ... other methods ...
+            else:
+                merged = merge_linear(t_a, t_b, self.config.weight_a, self.config.weight_b)
+            
+            if "dare" not in self.config.method and self.config.density < 1.0:
+                merged = apply_density(merged, self.config.density)
+            
+            return merged
 
 # ==================== CORE MERGE FUNCTION ====================
 
@@ -1501,8 +1425,15 @@ def merge_loras(path_a: Union[str, Path], path_b: Union[str, Path],
     
     # Normalize BOTH to the same intermediate format for merging
     print("🔄 Normalizing formats for merging...")
-    sd_a_norm = universal_normalize(sd_a)
-    sd_b_norm = universal_normalize(sd_b)
+    sd_a_norm = universal_normalize(sd_a, metadata=meta_a)
+    sd_b_norm = universal_normalize(sd_b, metadata=meta_b)
+    
+    # In your merge_loras function, after normalization:
+    print("🔍 FIRST 10 KEYS AFTER NORMALIZATION:")
+    for i, key in enumerate(list(sd_a_norm.keys())[:10]):
+        print(f"  A{i}: {key}")
+    for i, key in enumerate(list(sd_b_norm.keys())[:10]):
+        print(f"  B{i}: {key}")
     
     # Merge metadata
     preserved_metadata = MetadataMerger.merge(meta_a, meta_b, config.metadata_mode)
@@ -1542,6 +1473,8 @@ def merge_loras(path_a: Union[str, Path], path_b: Union[str, Path],
     # Create final metadata
     merge_metadata = {
         "lora_merge_tool": "EasyLoRAMerger",
+        "easy_lora_merger_version": EASY_LORA_MERGER_VERSION,  # ADD THIS
+        "easy_lora_merger_date": EASY_LORA_MERGER_DATE,        # ADD THIS
         "merge_method": config.method,
         "density": str(config.density),
         "lora_a_weight": str(config.weight_a),
@@ -1606,6 +1539,8 @@ def merge_loras(path_a: Union[str, Path], path_b: Union[str, Path],
 class EasyLoRAmergerNode:
     """ComfyUI node for merging LoRAs with security and performance enhancements."""
     
+    _CACHE = {}
+    
     @classmethod
     def INPUT_TYPES(cls):
         loras = folder_paths.get_filename_list("loras")
@@ -1620,40 +1555,85 @@ class EasyLoRAmergerNode:
             "fp8": "⚠️ Experimental: FP8 operations may not be fully implemented. Will fall back to bfloat16 if needed."
         }
         
+        # Method tooltips for better UX
+        method_tooltips = {
+            "linear": "Simple weighted average - good starting point",
+            "ties_strict": "Keep only where signs agree - good for conflicting styles",
+            "ties_gentle": "Apply TIES only for strong disagreements",
+            "dare_lite": "Random dropout without rescaling - experimental",
+            "dare_rescale": "Random dropout with rescaling - maintains magnitude",
+            "subtract": "Subtract B from A - remove unwanted styles",
+            "magnitude": "Keep larger magnitude from either LoRA - blend controls strictness",
+            "feature_mix": "Preserve unique features from each LoRA - uniqueness controls preservation",
+            "svd_preserve": "SVD-based rank reduction - preserves structure",
+            "noise_aware": "Reduce small noise values before merging",
+            "gradient_alignment": "Weight by directional similarity"
+        }
+        
         return {
             "required": {
                 "model": ("MODEL",),
                 "clip": ("CLIP",),
-                "method": (MergeMethodRegistry.list_methods(), {
+                "method": (["linear", "ties_strict", "ties_gentle", "dare_lite", 
+                           "dare_rescale", "subtract", "magnitude", "feature_mix",
+                           "svd_preserve", "noise_aware", "gradient_alignment"], {
                     "default": "linear",
                     "tooltip": "Choose merging method"
                 }),
-                "density": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 1.0, "step": 0.05}),
+                "density": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 1.0, "step": 0.05,
+                                      "tooltip": "Keep top % of weights (1.0 = all)"}),
             },
             "optional": {
                 "lora_a": (["None"] + loras,),
                 "lora_b": (["None"] + loras,),
                 "lora_data_a": ("LORA",),
                 "lora_data_b": ("LORA",),
-                "weight_a": ("FLOAT", {"default": 1.0, "min": -5, "max": 5, "step": 0.05}),
-                "weight_b": ("FLOAT", {"default": 1.0, "min": -5, "max": 5, "step": 0.05}),
-                "save_trigger": ("BOOLEAN", {"default": False}),
-                "save_folder": ("STRING", {"default": default_folder, "multiline": False}),
-                "filename": ("STRING", {"default": "merged_lora", "multiline": False}),
-                "attn_weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1}),
-                "mlp_weight": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.1}),
-                "confidence_a": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.1}),
-                "confidence_b": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.1}),
-                "device": (["auto", "cuda", "cpu"], {"default": "auto"}),
+                "weight_a": ("FLOAT", {"default": 1.0, "min": -5, "max": 5, "step": 0.05,
+                                       "tooltip": "Strength of first LoRA"}),
+                "weight_b": ("FLOAT", {"default": 1.0, "min": -5, "max": 5, "step": 0.05,
+                                       "tooltip": "Strength of second LoRA"}),
+                
+                # NEW PARAMETERS FOR NEW METHODS
+                "uniqueness": ("FLOAT", {"default": 0.7, "min": 0.1, "max": 1.0, "step": 0.05,
+                                        "tooltip": "For feature_mix: higher = preserve more unique features"}),
+                "threshold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                                       "tooltip": "For subtract: minimum magnitude to subtract (0 = all)"}),
+                "blend": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
+                                   "tooltip": "For magnitude: 0=strict selection, 1=equal blend"}),
+                
+                # SAVE OPTIONS
+                "save_trigger": ("BOOLEAN", {"default": False,
+                                             "tooltip": "Save permanently? (temp file if false)"}),
+                "save_folder": ("STRING", {"default": default_folder, "multiline": False,
+                                          "tooltip": "Folder to save in (full path or subfolder)"}),
+                "filename": ("STRING", {"default": "merged_lora", "multiline": False,
+                                       "tooltip": "Filename (auto-increments if exists)"}),
+                
+                # DEVICE OPTIONS
+                "device": (["auto", "cuda", "cpu"], {"default": "auto",
+                           "tooltip": "Device to use for merging"}),
                 "precision": (precision_options, {
                     "default": "auto",
                     "tooltip": precision_tooltips.get("fp8", "Select precision")
                 }),
+                
+                # METADATA OPTIONS
                 "metadata_mode": (["none", "preserve_a", "preserve_b", "merge_basic"], {
                     "default": "merge_basic",
+                    "tooltip": "How to handle metadata from source LoRAs"
                 }),
-                "batch_size": ("INT", {"default": 32, "min": 1, "max": 256, "step": 8}),
-                "streaming": ("BOOLEAN", {"default": True}),
+                
+                # PERFORMANCE OPTIONS
+                "batch_size": ("INT", {"default": 32, "min": 1, "max": 256, "step": 8,
+                                       "tooltip": "Tensors per batch (lower = less VRAM)"}),
+                "streaming": ("BOOLEAN", {"default": True,
+                                         "tooltip": "Stream tensors to save VRAM"}),
+                # METHOD INFO DISPLAY (read-only)
+                "method_info": ("STRING", {
+                    "default": "Select a method to see details here...", 
+                    "multiline": True, 
+                    "dynamicPrompts": False
+                }),
             }
         }
     
@@ -1691,13 +1671,14 @@ class EasyLoRAmergerNode:
         cls._CACHE[cache_key] = current_hash
         return current_hash
     
-    def merge(self, model, clip, method="linear", density=1.0,
+    def merge(self, model, clip, method="linear", density=1.0, 
               lora_a="None", lora_b="None", lora_data_a=None, lora_data_b=None,
-              weight_a=1.0, weight_b=1.0, save_trigger=False, save_folder="", 
-              filename="merged_lora", attn_weight=1.0, mlp_weight=0.7,
-              confidence_a=0.5, confidence_b=0.5, device="auto", 
-              precision="auto", metadata_mode="merge_basic",
-              batch_size=32, streaming=True):
+              weight_a=1.0, weight_b=1.0, 
+              uniqueness=0.7, threshold=0.0, blend=0.5,
+              save_trigger=False, save_folder="", filename="merged_lora",
+              device="auto", precision="auto", metadata_mode="merge_basic",
+              batch_size=32, streaming=True,
+              method_info=None):
         
         print("\n" + "="*50)
         print("🧩 Easy LoRA Merger (Secure & Optimized)")
@@ -1709,10 +1690,9 @@ class EasyLoRAmergerNode:
             density=density,
             weight_a=weight_a,
             weight_b=weight_b,
-            confidence_a=confidence_a,
-            confidence_b=confidence_b,
-            attn_weight=attn_weight,
-            mlp_weight=mlp_weight,
+            uniqueness=uniqueness,
+            threshold=threshold,
+            blend=blend,
             device_type=device,
             precision=precision,
             metadata_mode=metadata_mode,
@@ -1804,9 +1784,24 @@ class EasyLoRAmergerNode:
         # Load into model
         try:
             lora_data = comfy.utils.load_torch_file(str(output_path))
-            model_lora, clip_lora = comfy.sd.load_lora_for_models(
-                model, clip, lora_data, 1.0, 1.0
-            )
+            
+            # Check if this LoRA has any Text Encoder keys
+            te_key_patterns = ["lora_te", "conditioner", "text_model", "transformer.text"]
+            has_te_keys = any(any(pattern in k for pattern in te_key_patterns) for k in lora_data.keys())
+            
+            if has_te_keys:
+                print("🔤 LoRA contains Text Encoder keys - applying to CLIP")
+                model_lora, clip_lora = comfy.sd.load_lora_for_models(
+                    model, clip, lora_data, 1.0, 1.0
+                )
+            else:
+                print("ℹ️ No Text Encoder keys found - applying only to model")
+                # Apply only to model, keep clip unchanged
+                model_lora, _ = comfy.sd.load_lora_for_models(
+                    model, clip, lora_data, 1.0, 1.0
+                )
+                clip_lora = clip  # Return original clip
+                
         except Exception as e:
             print(f"❌ Load failed: {e}")
             return (model, clip, "")
@@ -1833,6 +1828,7 @@ class EasyLoRAmergerNode:
 # ==================== LORA-ONLY NODE ====================
 
 class EasyLoRAonlyMerger:
+    OUTPUT_NODE = True
     """Merge LoRAs without loading into model."""
     
     @classmethod
@@ -1843,33 +1839,93 @@ class EasyLoRAonlyMerger:
         if lora_folders:
             default_folder = str(lora_folders[0])
         
+        # Add tooltip about FP8 limitations
+        precision_options = ["auto", "float32", "bfloat16", "float16", "fp8"]
+        precision_tooltips = {
+            "fp8": "⚠️ Experimental: FP8 operations may not be fully implemented. Will fall back to bfloat16 if needed."
+        }
+        
+        # Method tooltips for better UX
+        method_tooltips = {
+            "linear": "Simple weighted average - good starting point",
+            "ties_strict": "Keep only where signs agree - good for conflicting styles",
+            "ties_gentle": "Apply TIES only for strong disagreements",
+            "dare_lite": "Random dropout without rescaling - experimental",
+            "dare_rescale": "Random dropout with rescaling - maintains magnitude",
+            "subtract": "Subtract B from A - remove unwanted styles",
+            "magnitude": "Keep larger magnitude from either LoRA - blend controls strictness",
+            "feature_mix": "Preserve unique features from each LoRA - uniqueness controls preservation",
+            "svd_preserve": "SVD-based rank reduction - preserves structure",
+            "noise_aware": "Reduce small noise values before merging",
+            "gradient_alignment": "Weight by directional similarity"
+        }
+        
         return {
             "required": {
-                "method": (MergeMethodRegistry.list_methods(), {"default": "linear"}),
-                "density": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 1.0, "step": 0.05}),
+                "method": (["linear", "ties_strict", "ties_gentle", "dare_lite", 
+                           "dare_rescale", "subtract", "magnitude", "feature_mix",
+                           "svd_preserve", "noise_aware", "gradient_alignment"], {
+                    "default": "linear",
+                    "tooltip": "Choose merging method"
+                }),
+                "density": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 1.0, "step": 0.05,
+                                      "tooltip": "Keep top % of weights (1.0 = all)"}),
             },
             "optional": {
                 "lora_a": (["None"] + loras,),
                 "lora_b": (["None"] + loras,),
                 "lora_data_a": ("LORA",),
                 "lora_data_b": ("LORA",),
-                "weight_a": ("FLOAT", {"default": 1.0, "min": -5, "max": 5, "step": 0.05}),
-                "weight_b": ("FLOAT", {"default": 1.0, "min": -5, "max": 5, "step": 0.05}),
-                "save_trigger": ("BOOLEAN", {"default": False}),
-                "save_folder": ("STRING", {"default": default_folder, "multiline": False}),
-                "filename": ("STRING", {"default": "merged_lora", "multiline": False}),
-                "attn_weight": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1}),
-                "mlp_weight": ("FLOAT", {"default": 0.7, "min": 0.0, "max": 2.0, "step": 0.1}),
-                "confidence_a": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.1}),
-                "confidence_b": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.1}),
-                "device": (["auto", "cuda", "cpu"], {"default": "auto"}),
-                "precision": (["auto", "float32", "bfloat16", "float16", "fp8"], {"default": "auto"}),
+                "weight_a": ("FLOAT", {"default": 1.0, "min": -5, "max": 5, "step": 0.05,
+                                       "tooltip": "Strength of first LoRA"}),
+                "weight_b": ("FLOAT", {"default": 1.0, "min": -5, "max": 5, "step": 0.05,
+                                       "tooltip": "Strength of second LoRA"}),
+                
+                # NEW PARAMETERS FOR NEW METHODS
+                "uniqueness": ("FLOAT", {"default": 0.7, "min": 0.1, "max": 1.0, "step": 0.05,
+                                        "tooltip": "For feature_mix: higher = preserve more unique features"}),
+                "threshold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                                       "tooltip": "For subtract: minimum magnitude to subtract (0 = all)"}),
+                "blend": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
+                                   "tooltip": "For magnitude: 0=strict selection, 1=equal blend"}),
+                
+                # SAVE OPTIONS
+                "save_trigger": ("BOOLEAN", {"default": False,
+                                             "tooltip": "Save permanently? (temp file if false)"}),
+                "save_folder": ("STRING", {"default": default_folder, "multiline": False,
+                                          "tooltip": "Folder to save in (full path or subfolder)"}),
+                "filename": ("STRING", {"default": "merged_lora", "multiline": False,
+                                       "tooltip": "Filename (auto-increments if exists)"}),
+                
+                # DEVICE OPTIONS
+                "device": (["auto", "cuda", "cpu"], {"default": "auto",
+                           "tooltip": "Device to use for merging"}),
+                "precision": (precision_options, {
+                    "default": "auto",
+                    "tooltip": precision_tooltips.get("fp8", "Select precision")
+                }),
+                
+                # METADATA OPTIONS
                 "metadata_mode": (["none", "preserve_a", "preserve_b", "merge_basic"], {
                     "default": "merge_basic",
+                    "tooltip": "How to handle metadata from source LoRAs"
                 }),
-                "batch_size": ("INT", {"default": 32, "min": 1, "max": 256, "step": 8}),
-                "streaming": ("BOOLEAN", {"default": True}),
-            }
+                
+                # PERFORMANCE OPTIONS
+                "batch_size": ("INT", {"default": 32, "min": 1, "max": 256, "step": 8,
+                                       "tooltip": "Tensors per batch (lower = less VRAM)"}),
+                "streaming": ("BOOLEAN", {"default": True,
+                                         "tooltip": "Stream tensors to save VRAM"}),
+                # METHOD INFO DISPLAY (read-only)
+                "method_info": ("STRING", {
+                    "default": "Select a method to see details here...", 
+                    "multiline": True, 
+                    "dynamicPrompts": False
+                }),
+            },
+            "hidden": {
+                "node_id": "UNIQUE_ID"
+            },
         }
     
     RETURN_TYPES = ("LORA", "STRING")
@@ -1877,28 +1933,30 @@ class EasyLoRAonlyMerger:
     FUNCTION = "merge_only"
     CATEGORY = "LoRA"
     
+    
     def merge_only(self, method="linear", density=1.0,
                    lora_a="None", lora_b="None", lora_data_a=None, lora_data_b=None,
-                   weight_a=1.0, weight_b=1.0, save_trigger=False, save_folder="", 
-                   filename="merged_lora", attn_weight=1.0, mlp_weight=0.7,
-                   confidence_a=0.5, confidence_b=0.5, device="auto", 
-                   precision="auto", metadata_mode="merge_basic",
-                   batch_size=32, streaming=True):
+                   weight_a=1.0, weight_b=1.0, 
+                   uniqueness=0.7, threshold=0.0, blend=0.5,
+                   save_trigger=False, save_folder="", filename="merged_lora",
+                   device="auto", precision="auto", metadata_mode="merge_basic",
+                   batch_size=32, streaming=True,
+                   method_info=None, node_id=None):
         
         print("\n" + "="*50)
-        print("🧩 LoRA-Only Merger (Secure & Optimized)")
+        print("🧩 LoRA-Only Merger")
         print("="*50)
         
-        # Create config
+        # Create config - REMOVE the undefined variables
         config = MergeConfig.from_inputs(
             method=method,
             density=density,
             weight_a=weight_a,
             weight_b=weight_b,
-            confidence_a=confidence_a,
-            confidence_b=confidence_b,
-            attn_weight=attn_weight,
-            mlp_weight=mlp_weight,
+            uniqueness=uniqueness,
+            threshold=threshold,
+            blend=blend,
+            # REMOVED: attn_weight, mlp_weight, confidence_a, confidence_b
             device_type=device,
             precision=precision,
             metadata_mode=metadata_mode,
@@ -1997,14 +2055,904 @@ class EasyLoRAonlyMerger:
         
         return (lora_tuple, str(output_path))
 
+# ==================== New Triple Merger Node ====================
+
+class EasyLoRATripleMerger:
+    """Merge THREE LoRAs at once and apply to model (experimental)"""
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        loras = folder_paths.get_filename_list("loras")
+        default_folder = ""
+        lora_folders = folder_paths.get_folder_paths("loras")
+        if lora_folders:
+            default_folder = str(lora_folders[0])
+        
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "clip": ("CLIP",),
+                "method": (["linear", "ties_strict", "feature_mix", "magnitude", "subtract", "dare_rescale"], 
+                          {"default": "linear"}),
+                "density": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 1.0, "step": 0.05}),
+            },
+            "optional": {
+                "lora_a": (["None"] + loras,),
+                "lora_b": (["None"] + loras,),
+                "lora_c": (["None"] + loras,),
+                "lora_data_a": ("LORA",),
+                "lora_data_b": ("LORA",),
+                "lora_data_c": ("LORA",),
+                "weight_a": ("FLOAT", {"default": 1.0, "min": -2.0, "max": 2.0, "step": 0.1}),
+                "weight_b": ("FLOAT", {"default": 1.0, "min": -2.0, "max": 2.0, "step": 0.1}),
+                "weight_c": ("FLOAT", {"default": 1.0, "min": -2.0, "max": 2.0, "step": 0.1}),
+                "uniqueness": ("FLOAT", {"default": 0.7, "min": 0.1, "max": 1.0, "step": 0.05,
+                                        "tooltip": "For feature_mix: higher = preserve more unique features"}),
+                "threshold": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05,
+                                       "tooltip": "For subtract: minimum magnitude to subtract"}),
+                "blend": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05,
+                                   "tooltip": "For magnitude: 0=strict, 1=blended"}),
+                "save_trigger": ("BOOLEAN", {"default": False}),
+                "save_folder": ("STRING", {"default": default_folder, "multiline": False}),
+                "filename": ("STRING", {"default": "triple_merged", "multiline": False}),
+                "device": (["auto", "cuda", "cpu"], {"default": "auto"}),
+                "precision": (["auto", "float32", "bfloat16", "float16"], {"default": "auto"}),
+                "batch_size": ("INT", {"default": 32, "min": 1, "max": 256, "step": 8}),
+                "method_info": ("STRING", {
+                    "default": "Select a method to see details...", 
+                    "multiline": True, 
+                    "dynamicPrompts": False
+                }),
+            }
+        }
+    
+    RETURN_TYPES = ("MODEL", "CLIP", "STRING", "LORA")
+    RETURN_NAMES = ("model", "clip", "save_path", "lora_data")
+    FUNCTION = "merge_triple"
+    CATEGORY = "LoRA/Experimental"
+    
+    def merge_triple(self, model, clip, method="linear", density=1.0,
+                    lora_a="None", lora_b="None", lora_c="None",
+                    lora_data_a=None, lora_data_b=None, lora_data_c=None,
+                    weight_a=1.0, weight_b=1.0, weight_c=1.0,
+                    uniqueness=0.7, threshold=0.0, blend=0.5,
+                    save_trigger=False, save_folder="", filename="triple_merged",
+                    device="auto", precision="auto", batch_size=32,
+                    method_info=None):
+        
+        print("\n" + "="*50)
+        print("🎨 Easy LoRA Triple Merger (Experimental)")
+        print("="*50)
+        
+        # Create config with only the variables we have
+        config = MergeConfig(
+            method=method,
+            density=density,
+            weight_a=weight_a,
+            weight_b=weight_b,
+            uniqueness=uniqueness,
+            threshold=threshold,
+            blend=blend,
+            device_type=device,
+            precision=precision,
+            batch_size=batch_size,
+            streaming=True
+        )
+        
+        # Get paths for all three LoRAs
+        paths = []
+        loras_data = [lora_data_a, lora_data_b, lora_data_c]
+        loras_dropdown = [lora_a, lora_b, lora_c]
+        names = ["A", "B", "C"]
+        
+        for i, (data, dropdown, name) in enumerate(zip(loras_data, loras_dropdown, names)):
+            if data is not None:
+                path = save_lora_data_to_temp(data, name)
+                print(f"📄 {name}: LORA data (temp)")
+                paths.append(path)
+            elif dropdown != "None" and dropdown:
+                path = folder_paths.get_full_path("loras", dropdown)
+                print(f"📄 {name}: {dropdown}")
+                paths.append(path)
+            else:
+                print(f"❌ {name}: Missing input")
+                return (model, clip, "", None)
+        
+        # Output path logic
+        if save_trigger:
+            output_path = get_user_output_path(save_folder, filename)
+        else:
+            output_path = get_experiment_temp_path("triple")
+        
+        # Load all three
+        print("📥 Loading LoRAs...")
+        sds = []
+        metas = []
+        for path in paths:
+            sd, meta = load_lora_with_metadata(Path(path))
+            sds.append(sd)
+            metas.append(meta)
+        
+        # Check if they're all the same type
+        print("🔍 Detecting formats...")
+        formats = [detect_lora_format(sd) for sd in sds]
+        print(f"   Formats: {formats}")
+        
+        # Normalize all to common format
+        print("🔄 Normalizing...")
+        normalized_sds = [universal_normalize(sd) for sd in sds]
+        
+        # Merge using triple method
+        print(f"🎯 Method: {method}")
+        merged_dict = self._merge_triple_method(
+            normalized_sds, 
+            [weight_a, weight_b, weight_c],
+            method, density, uniqueness, threshold, blend
+        )
+        
+        # Finalize and save
+        final_dict = universal_finalize(merged_dict)
+        save_file(final_dict, str(output_path))
+        
+        print(f"✅ Saved: {output_path.name}")
+        
+        # Load into model
+        try:
+            lora_data = comfy.utils.load_torch_file(str(output_path))
+            model_lora, clip_lora = comfy.sd.load_lora_for_models(
+                model, clip, lora_data, 1.0, 1.0
+            )
+            lora_tuple = (lora_data, 1.0, 1.0)
+        except Exception as e:
+            print(f"❌ Load failed: {e}")
+            return (model, clip, "", None)
+        
+        print("="*50)
+        print("🎉 Triple Merge Complete!")
+        print("="*50)
+        
+        return (model_lora, clip_lora, str(output_path), lora_tuple)
+    
+    def _merge_triple_method(self, sds, weights, method, density, uniqueness, threshold, blend):
+        """Core triple merge logic"""
+        all_keys = set()
+        for sd in sds:
+            all_keys.update(sd.keys())
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        merged = {}
+        
+        for key in all_keys:
+            tensors = []
+            valid_weights = []
+            
+            for i, sd in enumerate(sds):
+                if key in sd:
+                    tensors.append(sd[key].to(device).to(torch.bfloat16))
+                    valid_weights.append(weights[i])
+            
+            if len(tensors) < 2:
+                if tensors:
+                    merged[key] = (tensors[0] * valid_weights[0]).cpu()
+                continue
+            
+            # Apply method
+            if method == "linear":
+                result = sum(t * w for t, w in zip(tensors, valid_weights))
+            
+            elif method == "ties_strict":
+                signs = [torch.sign(t * w) for t, w in zip(tensors, valid_weights)]
+                agreement = torch.stack(signs).float().mean(dim=0).abs() > 0.5
+                result = sum(t * w for t, w in zip(tensors, valid_weights)) * agreement
+            
+            elif method == "feature_mix":
+                result = tensors[0] * valid_weights[0]
+                for i in range(1, len(tensors)):
+                    current = tensors[i] * valid_weights[i]
+                    ratio = current.abs() / (result.abs() + 1e-8)
+                    unique_mask = (ratio > (1/uniqueness)).float()
+                    result = result * (1 - unique_mask) + current * unique_mask
+            
+            elif method == "magnitude":
+                stacked = torch.stack([t * w for t, w in zip(tensors, valid_weights)])
+                magnitudes = stacked.abs()
+                winner = magnitudes.argmax(dim=0)
+                selected = torch.gather(stacked, 0, winner.unsqueeze(0)).squeeze(0)
+                averaged = stacked.mean(dim=0)
+                result = selected * blend + averaged * (1 - blend)
+            
+            elif method == "subtract":
+                # Start with A
+                result = tensors[0] * valid_weights[0]
+                
+                # Subtract B and C
+                for i in range(1, len(tensors)):
+                    current = tensors[i] * valid_weights[i]
+                    
+                    if threshold > 0:
+                        # Only subtract where current is significant relative to result
+                        result_magnitude = result.abs()
+                        current_magnitude = current.abs()
+                        
+                        # Create mask where current is significant
+                        significant = current_magnitude > (threshold * result_magnitude + 1e-8)
+                        
+                        # Only subtract significant parts
+                        result = result - current * significant.float()
+                    else:
+                        # Subtract everything
+                        result = result - current
+            
+            elif method == "dare_rescale":
+                drop_rate = 1.0 - density
+                results = []
+                for t, w in zip(tensors, valid_weights):
+                    mask = (torch.rand_like(t) > drop_rate).float()
+                    rescale = 1.0 / (1.0 - drop_rate) if drop_rate < 1.0 else 1.0
+                    results.append(t * mask * rescale * w)
+                result = sum(results)
+            
+            # Apply density if needed
+            if density < 1.0 and method not in ["dare_rescale"]:
+                flat = result.abs().flatten()
+                k = max(1, int(flat.numel() * density))
+                threshold_val = torch.topk(flat, k).values.min()
+                mask = result.abs() >= threshold_val
+                result = result * mask
+            
+            merged[key] = result.cpu()
+        
+        return merged
+
+
+# ==================== MUSUBI LORA CONVERSION NODE ====================
+
+class MusubiLoraConverter:
+    OUTPUT_NODE = True
+    """
+    Dedicated node for converting Musubi Tuner LoRAs to standard format.
+    Supports: Z-Image (base/turbo), Klein 4B, Klein 9B
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        loras = folder_paths.get_filename_list("loras")
+        default_folder = ""
+        lora_folders = folder_paths.get_folder_paths("loras")
+        if lora_folders:
+            default_folder = str(lora_folders[0])
+        
+        return {
+            "required": {
+                "mode": (["auto_detect", "z_image", "klein_4b", "klein_9b"], 
+                        {"default": "auto_detect"}),
+                "save_trigger": ("BOOLEAN", {"default": False}),
+                "filename": ("STRING", {"default": "converted_lora", "multiline": False}),
+            },
+            "optional": {
+                "lora": (["None"] + loras,),
+                "lora_data": ("LORA",),
+                "save_folder": ("STRING", {"default": default_folder, "multiline": False}),
+                "keep_alphas": ("BOOLEAN", {"default": False, 
+                                           "tooltip": "Keep alpha keys (usually not needed after conversion)"}),
+                "debug": ("BOOLEAN", {"default": False, "tooltip": "Show detailed conversion info"}),
+            },
+            "hidden": {
+                "node_id": "UNIQUE_ID"
+            },
+        }
+    
+    RETURN_TYPES = ("LORA", "STRING", "STRING")
+    RETURN_NAMES = ("converted_lora", "save_path", "conversion_info")
+    FUNCTION = "convert"
+    CATEGORY = "LoRA/Musubi"
+    
+    def convert(self, mode="auto_detect", save_trigger=False, filename="converted_lora",
+                lora="None", lora_data=None, save_folder="", keep_alphas=False, debug=False, node_id=None):
+        
+        print("\n" + "="*50)
+        print("🔄 Musubi LoRA Converter")
+        print("="*50)
+        
+        # Get input path
+        if lora_data is not None:
+            path = save_lora_data_to_temp(lora_data, "musubi")
+            source_type = "LORA data input"
+        elif lora != "None" and lora:
+            path = folder_paths.get_full_path("loras", lora)
+            source_type = f"dropdown: {lora}"
+        else:
+            print("❌ No LoRA input provided")
+            return (None, "", "No input")
+        
+        print(f"📄 Source: {source_type}")
+        print(f"📁 Path: {path}")
+        
+        # Load the LoRA
+        sd, metadata = load_lora_with_metadata(Path(path))
+        
+        # Detect actual format
+        detected_format = detect_lora_format(sd)
+        print(f"🔍 Detected format: {detected_format}")
+        
+        # Analyze structure
+        info = self.analyze_lora_structure(sd)
+        if debug:
+            print("\n📊 Structure analysis:")
+            print(f"   Total keys: {info['key_count']}")
+            print(f"   Has alphas: {info['has_alphas']}")
+            print(f"   Hidden dims: {info['hidden_dims'][:5]}")
+            print(f"   Structure: {info['structure'][:5]}")
+        
+        # Determine if conversion is needed
+        needs_conversion = any([
+            "musubi" in detected_format.lower() and "needs_conversion" in detected_format,
+            info['has_alphas'] and any('lora_unet_' in k for k in sd.keys()),
+            mode != "auto_detect"  # Manual override
+        ])
+        
+        if not needs_conversion and mode == "auto_detect":
+            print("✅ LoRA already in standard format, no conversion needed")
+            # Still return as LORA data
+            lora_tuple = (sd, 1.0, 1.0)
+            return (lora_tuple, "", "Already in standard format")
+        
+        # Determine conversion type
+        if mode != "auto_detect":
+            conversion_type = mode
+        elif "z_image" in detected_format or any('lora_unet_layers' in k for k in sd.keys()):
+            conversion_type = "z_image"
+        elif "klein" in detected_format or any('lora_unet_double_blocks' in k for k in sd.keys()):
+            # Check if it's 9B by looking at hidden dimensions
+            if 4096 in info['hidden_dims']:
+                conversion_type = "klein_9b"
+            else:
+                conversion_type = "klein_4b"
+        else:
+            conversion_type = "z_image"  # Default fallback
+        
+        print(f"🔄 Converting as: {conversion_type}")
+        
+        # Perform conversion
+        if conversion_type == "z_image":
+            converted_sd = self.convert_zimage(sd, keep_alphas)
+        elif conversion_type == "klein_4b":
+            converted_sd = self.convert_klein_4b(sd, keep_alphas)
+        elif conversion_type == "klein_9b":
+            converted_sd = self.convert_klein_9b(sd, keep_alphas)
+        else:
+            converted_sd = self.convert_zimage(sd, keep_alphas)
+        
+        print(f"✅ Converted: {info['key_count']} → {len(converted_sd)} keys")
+        
+        # Save if requested
+        save_path = ""
+        if save_trigger:
+            try:
+                if save_folder:
+                    output_folder = Path(save_folder)
+                else:
+                    lora_folders = folder_paths.get_folder_paths("loras")
+                    output_folder = Path(lora_folders[0]) if lora_folders else Path.cwd()
+                
+                output_folder.mkdir(parents=True, exist_ok=True)
+                
+                # Add suffix based on conversion
+                base_name = filename.replace('.safetensors', '')
+                output_path = output_folder / f"{base_name}_converted.safetensors"
+                
+                # Auto-increment
+                counter = 1
+                while output_path.exists():
+                    output_path = output_folder / f"{base_name}_converted_{counter}.safetensors"
+                    counter += 1
+                
+                # Save
+                save_file(converted_sd, str(output_path))
+                save_path = str(output_path)
+                print(f"💾 Saved to: {save_path}")
+                
+            except Exception as e:
+                print(f"❌ Save failed: {e}")
+        
+        # Create LORA tuple for output
+        lora_tuple = (converted_sd, 1.0, 1.0)
+        
+        # Create info string
+        info_str = (f"Converted {conversion_type}: {info['key_count']} → {len(converted_sd)} keys, "
+                   f"Alphas: {'kept' if keep_alphas else 'baked'}")
+        
+        print("="*50)
+        return (lora_tuple, save_path, info_str)
+    
+    def analyze_lora_structure(self, sd):
+        """Analyze LoRA structure to determine conversion needs."""
+        keys = list(sd.keys())
+        
+        # Get hidden dimensions
+        hidden_dims = set()
+        for key, tensor in sd.items():
+            if len(tensor.shape) >= 2:
+                hidden_dims.add(tensor.shape[0])
+                hidden_dims.add(tensor.shape[1])
+        
+        # Detect structure types
+        structure = []
+        if any('double_blocks' in k for k in keys):
+            structure.append('flux_double')
+        if any('single_blocks' in k for k in keys):
+            structure.append('flux_single')
+        if any('lora_unet_layers' in k for k in keys):
+            structure.append('z_image_style')
+        
+        # Get unique prefixes
+        prefixes = set()
+        for key in keys[:10]:  # Sample first 10
+            parts = key.split('.')
+            if parts:
+                prefixes.add(parts[0])
+        
+        return {
+            'key_count': len(keys),
+            'hidden_dims': sorted(list(hidden_dims))[:10],
+            'structure': structure,
+            'has_alphas': any('.alpha' in k for k in keys),
+            'prefixes': list(prefixes)[:5]
+        }
+    
+    def convert_zimage(self, sd, keep_alphas=False):
+        """Convert Z-Image (base/turbo) format to standard."""
+        converted = {}
+        
+        # Pattern: lora_unet_layers_X_attention_to_k.lora_down.weight
+        # Target: diffusion_model.layers.X.attention.to_k.lora_A.weight
+        
+        for key, tensor in sd.items():
+            new_key = key
+            
+            # Skip alpha keys if we're baking them
+            if '.alpha' in key and not keep_alphas:
+                continue
+            
+            # Convert prefix
+            new_key = new_key.replace('lora_unet_', 'diffusion_model.')
+            
+            # Convert layer pattern: layers_X_ → layers.X.
+            new_key = re.sub(r'layers_(\d+)_', r'layers.\1.', new_key)
+            
+            # Convert attention: attention_to_k → attention.to_k
+            new_key = re.sub(r'attention_to_([kqv])', r'attention.to_\1', new_key)
+            new_key = new_key.replace('attention_to_out_0', 'attention.to_out.0')
+            
+            # Convert feed forward: feed_forward_w1 → feed_forward.w1
+            new_key = re.sub(r'feed_forward_w(\d)', r'feed_forward.w\1', new_key)
+            
+            # Convert lora naming
+            if 'lora_down' in new_key:
+                new_key = new_key.replace('lora_down.weight', 'lora_A.weight')
+            elif 'lora_up' in new_key:
+                new_key = new_key.replace('lora_up.weight', 'lora_B.weight')
+            
+            # Clean up double dots
+            while '..' in new_key:
+                new_key = new_key.replace('..', '.')
+            
+            # If this is an alpha key and we're not keeping it, bake it
+            if '.alpha' in key and not keep_alphas:
+                # Find corresponding weight key
+                base_key = key.replace('.alpha', '')
+                weight_key = None
+                
+                # Try both lora_down and lora_up
+                for suffix in ['lora_down.weight', 'lora_up.weight']:
+                    candidate = f"{base_key}.{suffix}"
+                    if candidate in sd:
+                        weight_key = candidate
+                        break
+                
+                if weight_key and weight_key in sd:
+                    # Alpha will be baked during merge, so we skip it
+                    continue
+            else:
+                converted[new_key] = tensor
+        
+        return converted
+    
+    def convert_klein_4b(self, sd, keep_alphas=False):
+        """Convert Klein 4B format to standard."""
+        converted = {}
+        
+        # Pattern: lora_unet_double_blocks_0_img_attn_qkv.lora_down.weight
+        # Target: diffusion_model.double_blocks.0.img_attn.qkv.lora_A.weight
+        
+        for key, tensor in sd.items():
+            new_key = key
+            
+            # Skip alpha keys if we're baking them
+            if '.alpha' in key and not keep_alphas:
+                continue
+            
+            # Convert prefix
+            new_key = new_key.replace('lora_unet_', 'diffusion_model.')
+            
+            # Convert double/single blocks
+            new_key = re.sub(r'(double|single)_blocks_(\d+)_', r'\1_blocks.\2.', new_key)
+            
+            # Convert attention: img_attn_qkv → img_attn.qkv
+            new_key = re.sub(r'(img|txt)_attn_(proj|qkv)', r'\1_attn.\2', new_key)
+            
+            # Convert MLP: img_mlp_0 → img_mlp.0
+            new_key = re.sub(r'(img|txt)_mlp_(\d+)', r'\1_mlp.\2', new_key)
+            
+            # Convert lora naming
+            if 'lora_down' in new_key:
+                new_key = new_key.replace('lora_down.weight', 'lora_A.weight')
+            elif 'lora_up' in new_key:
+                new_key = new_key.replace('lora_up.weight', 'lora_B.weight')
+            
+            # Clean up double dots
+            while '..' in new_key:
+                new_key = new_key.replace('..', '.')
+            
+            # If this is an alpha key and we're not keeping it, bake it
+            if '.alpha' in key and not keep_alphas:
+                # Find corresponding weight key
+                base_key = key.replace('.alpha', '')
+                weight_key = None
+                
+                for suffix in ['lora_down.weight', 'lora_up.weight']:
+                    candidate = f"{base_key}.{suffix}"
+                    if candidate in sd:
+                        weight_key = candidate
+                        break
+                
+                if weight_key and weight_key in sd:
+                    # Alpha will be baked during merge
+                    continue
+            else:
+                converted[new_key] = tensor
+        
+        return converted
+    
+    def convert_klein_9b(self, sd, keep_alphas=False):
+        """Convert Klein 9B format to standard."""
+        # 9B has larger hidden dimensions (4096 vs 3072)
+        converted = {}
+        
+        # Same patterns as 4B, just different dimensions
+        for key, tensor in sd.items():
+            new_key = key
+            
+            if '.alpha' in key and not keep_alphas:
+                continue
+            
+            new_key = new_key.replace('lora_unet_', 'diffusion_model.')
+            new_key = re.sub(r'(double|single)_blocks_(\d+)_', r'\1_blocks.\2.', new_key)
+            new_key = re.sub(r'(img|txt)_attn_(proj|qkv)', r'\1_attn.\2', new_key)
+            new_key = re.sub(r'(img|txt)_mlp_(\d+)', r'\1_mlp.\2', new_key)
+            
+            if 'lora_down' in new_key:
+                new_key = new_key.replace('lora_down.weight', 'lora_A.weight')
+            elif 'lora_up' in new_key:
+                new_key = new_key.replace('lora_up.weight', 'lora_B.weight')
+            
+            while '..' in new_key:
+                new_key = new_key.replace('..', '.')
+            
+            if '.alpha' in key and not keep_alphas:
+                base_key = key.replace('.alpha', '')
+                weight_key = None
+                
+                for suffix in ['lora_down.weight', 'lora_up.weight']:
+                    candidate = f"{base_key}.{suffix}"
+                    if candidate in sd:
+                        weight_key = candidate
+                        break
+                
+                if weight_key and weight_key in sd:
+                    continue
+            else:
+                converted[new_key] = tensor
+        
+        return converted
+
+# ==================== Z-IMAGE NORMALIZER NODE ====================
+
+class ZImageNormalizer:
+    OUTPUT_NODE = True
+    """Simple Z-Image LoRA normalizer"""
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        loras = folder_paths.get_filename_list("loras")
+        lora_folders = folder_paths.get_folder_paths("loras")
+        default_folder = str(lora_folders[0]) if lora_folders else ""
+        
+        return {
+            "required": {
+                "mode": (["standardize_only", "detect_only"], 
+                        {"default": "standardize_only"}),
+                "target_weight": ("FLOAT", {"default": 1.5, "min": 0.1, "max": 3.0, "step": 0.1,
+                                           "tooltip": "Recommended weight (user decides)"}),
+            },
+            "optional": {
+                "lora": (["None"] + loras,),
+                "lora_data": ("LORA",),
+                "save_trigger": ("BOOLEAN", {"default": False}),
+                "save_folder": ("STRING", {"default": default_folder, "multiline": False}),
+                "filename": ("STRING", {"default": "normalized_zimage", "multiline": False}),
+            },
+            "hidden": {
+                "node_id": "UNIQUE_ID"
+            },
+        }
+    
+    RETURN_TYPES = ("LORA", "STRING", "STRING")
+    RETURN_NAMES = ("normalized_lora", "info", "recommended_weight")
+    FUNCTION = "normalize"
+    CATEGORY = "LoRA/Z-Image"
+    
+    def normalize(self, mode="standardize_only", target_weight=1.5,
+                  lora="None", lora_data=None, save_trigger=False, 
+                  save_folder="", filename="normalized_zimage", node_id=None):
+        
+        print("\n" + "="*50)
+        print("🔄 Z-Image Normalizer")
+        print("="*50)
+        
+        # Load LoRA
+        from pathlib import Path
+        import folder_paths
+        from safetensors.torch import load_file, save_file
+        
+        if lora_data is not None:
+            sd, _ = lora_data
+            source = "LORA data"
+            source_name = "data_input"
+        elif lora != "None" and lora:
+            path = folder_paths.get_full_path("loras", lora)
+            sd = load_file(str(path))
+            source = f"file: {lora}"
+            source_name = Path(lora).stem
+        else:
+            print("❌ No LoRA input")
+            return (None, "No input", "1.0")
+        
+        print(f"📄 Source: {source}")
+        print(f"📊 Keys: {len(sd)}")
+        
+        # Detect trainer
+        info = []
+        recommended = "1.0"
+        
+        if any('lora_unet_layers' in k for k in sd.keys()):
+            info.append("Musubi-tuner format")
+            if len(sd) > 600:
+                info.append("unconverted (has alphas)")
+            else:
+                info.append("converted")
+        elif any('adaLN_modulation' in k for k in sd.keys()):
+            info.append("AI Toolkit format (likely Base)")
+            recommended = str(target_weight)
+        elif any('attention.to' in k for k in sd.keys()):
+            info.append("AI Toolkit format (likely Turbo)")
+        else:
+            info.append("Unknown format")
+        
+        # Apply standardization if requested
+        if mode == "standardize_only":
+            # Just ensure consistent naming (no conversion)
+            new_sd = {}
+            for key, tensor in sd.items():
+                # Simple cleanup - remove double dots if any
+                new_key = key.replace('..', '.')
+                new_sd[new_key] = tensor
+            sd = new_sd
+            info.append("standardized")
+        
+        info_str = ", ".join(info)
+        print(f"🔍 Detection: {info_str}")
+        print(f"💡 Recommended weight: {recommended}")
+        
+        # Save if requested
+        save_path = ""
+        if save_trigger:
+            try:
+                # Handle save folder
+                if save_folder and save_folder.strip():
+                    output_folder = Path(save_folder)
+                else:
+                    lora_folders = folder_paths.get_folder_paths("loras")
+                    output_folder = Path(lora_folders[0]) if lora_folders else Path.cwd()
+                
+                output_folder.mkdir(parents=True, exist_ok=True)
+                
+                # Create filename
+                base_name = filename if filename else source_name
+                if not base_name.endswith('.safetensors'):
+                    base_name += '.safetensors'
+                
+                output_path = output_folder / base_name
+                
+                # Auto-increment
+                counter = 1
+                while output_path.exists():
+                    stem = output_path.stem
+                    if '_' in stem and stem.split('_')[-1].isdigit():
+                        stem = '_'.join(stem.split('_')[:-1])
+                    output_path = output_folder / f"{stem}_{counter}.safetensors"
+                    counter += 1
+                
+                save_file(sd, str(output_path))
+                save_path = str(output_path)
+                print(f"💾 Saved to: {save_path}")
+                
+            except Exception as e:
+                print(f"❌ Save failed: {e}")
+        
+        print("="*50)
+        return ((sd, 1.0, 1.0), info_str, recommended)
+
+
+# ==================== EXPERIMENTAL: BASE MODEL MERGER ====================
+
+class EasyLoRABaseMerger:
+    """EXPERIMENTAL: Merge LoRAs directly into base model (bakes them in)"""
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        loras = folder_paths.get_filename_list("loras")
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "clip": ("CLIP",),
+                "method": (["linear", "ties_strict", "ties_gentle", "feature_mix", 
+                           "magnitude", "subtract", "dare_rescale"], 
+                          {"default": "linear"}),
+                "density": ("FLOAT", {"default": 1.0, "min": 0.1, "max": 1.0, "step": 0.05}),
+            },
+            "optional": {
+                "lora_a": (["None"] + loras,),
+                "lora_b": (["None"] + loras,),
+                "lora_data_a": ("LORA",),
+                "lora_data_b": ("LORA",),
+                "weight_a": ("FLOAT", {"default": 1.0, "min": -2.0, "max": 2.0, "step": 0.1}),
+                "weight_b": ("FLOAT", {"default": 1.0, "min": -2.0, "max": 2.0, "step": 0.1}),
+                
+                # Method-specific sliders
+                "uniqueness": ("FLOAT", {"default": 0.7, "min": 0.1, "max": 1.0, "step": 0.05}),
+                "threshold": ("FLOAT", {"default": 0.2, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "blend": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}),
+                
+                # Device options
+                "device": (["auto", "cuda", "cpu"], {"default": "auto"}),
+                "precision": (["auto", "float32", "bfloat16", "float16"], {"default": "auto"}),
+            },
+            "hidden": {
+                "node_id": "UNIQUE_ID"
+            },
+        }
+    
+    RETURN_TYPES = ("MODEL", "CLIP", "STRING")
+    RETURN_NAMES = ("model", "clip", "info")
+    FUNCTION = "merge_into_base"
+    CATEGORY = "LoRA/Experimental"
+    
+    def merge_into_base(self, model, clip, method="linear", density=1.0,
+                        lora_a="None", lora_b="None", 
+                        lora_data_a=None, lora_data_b=None,
+                        weight_a=1.0, weight_b=1.0,
+                        uniqueness=0.7, threshold=0.2, blend=0.5,
+                        device="auto", precision="auto", **kwargs):
+        
+        print("\n" + "="*50)
+        print("🔥 BASE MODEL MERGER (Experimental)")
+        print("="*50)
+        print("⚠️  This bakes LoRAs directly into the model!")
+        print("   The result is a new model with LoRAs permanently merged")
+        print("="*50)
+        
+        # Create config
+        config = MergeConfig(
+            method=method,
+            density=density,
+            weight_a=weight_a,
+            weight_b=weight_b,
+            uniqueness=uniqueness,
+            threshold=threshold,
+            blend=blend,
+            device_type=device,
+            precision=precision,
+            batch_size=32,
+            streaming=True
+        )
+        
+        # Get LoRA paths
+        from .easy_lora_merger import save_lora_data_to_temp, load_lora_with_metadata, merge_loras, get_experiment_temp_path
+        
+        path_a = None
+        path_b = None
+        
+        if lora_data_a is not None:
+            path_a = save_lora_data_to_temp(lora_data_a, "A")
+            print(f"📄 A: LORA data")
+        elif lora_a != "None" and lora_a:
+            path_a = folder_paths.get_full_path("loras", lora_a)
+            print(f"📄 A: {lora_a}")
+        
+        if lora_data_b is not None:
+            path_b = save_lora_data_to_temp(lora_data_b, "B")
+            print(f"📄 B: LORA data")
+        elif lora_b != "None" and lora_b:
+            path_b = folder_paths.get_full_path("loras", lora_b)
+            print(f"📄 B: {lora_b}")
+        
+        if not path_a or not path_b:
+            print("❌ Need two LoRAs")
+            return (model, clip, "Error: Need two LoRAs")
+        
+        print(f"⚖️  Weights: {weight_a} : {weight_b}")
+        print(f"🎯 Method: {method}")
+        
+        # Create temp path for merged LoRA
+        temp_path = get_experiment_temp_path("base_merge")
+        
+        # Merge the LoRAs
+        try:
+            merged_dict = merge_loras(path_a, path_b, config, temp_path)
+            print(f"✅ LoRAs merged: {len(merged_dict)} keys")
+        except Exception as e:
+            print(f"❌ Merge failed: {e}")
+            return (model, clip, f"Error: {e}")
+        
+        # Load the merged LoRA
+        try:
+            lora_data = comfy.utils.load_torch_file(str(temp_path))
+            print(f"📥 Loaded merged LoRA")
+        except Exception as e:
+            print(f"❌ Failed to load merged LoRA: {e}")
+            return (model, clip, f"Error: {e}")
+        
+        # BAKE IT INTO THE MODEL (strength 1.0 = full bake)
+        print("🔥 Baking LoRA into base model...")
+        try:
+            model_baked, clip_baked = comfy.sd.load_lora_for_models(
+                model, clip, lora_data, 1.0, 1.0
+            )
+            print("✅ LoRA baked successfully!")
+        except Exception as e:
+            print(f"❌ Failed to bake LoRA: {e}")
+            return (model, clip, f"Error: {e}")
+        
+        # Clean up temp file
+        try:
+            temp_path.unlink()
+        except:
+            pass
+        
+        info = f"Baked {method} merge (w={weight_a},{weight_b}) into base model"
+        print("="*50)
+        print("🎉 Base model ready with baked LoRAs!")
+        print("="*50)
+        
+        return (model_baked, clip_baked, info)
+
 # ==================== REGISTRATION ====================
 
 NODE_CLASS_MAPPINGS = {
     "EasyLoRAmerger": EasyLoRAmergerNode,
-    "EasyLoRAonlyMerger": EasyLoRAonlyMerger
+    "EasyLoRAonlyMerger": EasyLoRAonlyMerger,
+    "EasyLoRATripleMerger": EasyLoRATripleMerger,
+    "MusubiLoraConverter": MusubiLoraConverter,
+    "ZImageNormalizer": ZImageNormalizer,
+    "EasyLoRABaseMerger": EasyLoRABaseMerger,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "EasyLoRAmerger": "Easy LoRA Merger",
-    "EasyLoRAonlyMerger": "Easy LoRA-Only Merger"
+    "EasyLoRAonlyMerger": "Easy LoRA-Only Merger",
+    "EasyLoRATripleMerger": "🎨 Easy LoRA Triple Merger (Experimental)",
+    "MusubiLoraConverter": "🔄 Musubi LoRA Converter (Experimental)",
+    "ZImageNormalizer": "🔄 Z-Image Normalizer (Experimental)",
+    "EasyLoRABaseMerger": "🔥 Bake LoRAs into Base Model (Experimental)",
 }
