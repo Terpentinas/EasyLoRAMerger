@@ -1,44 +1,47 @@
-# Easy LoRA Merger for ComfyUI
+🛠️ Easy LoRA Merger: Complexity Made Simple
 
-*A simple tool for experimenting with LoRA merging - created mainly for Flux Klein 4B/9B*
+Models are evolving fast—between Z-Image, Klein 4B/9B, Flux 2 Dev, and SDXL, it's a lot to keep track of. I built this suite of nodes because I wanted a way to merge these different architectures without worrying about tensor dimensions or scaling math.
 
-[![GitHub](https://img.shields.io/github/license/Terpentinas/EasyLoRAMerger)](LICENSE)
-[![ComfyUI](https://img.shields.io/badge/ComfyUI-Custom%20Node-green)](https://github.com/comfyanonymous/ComfyUI)
+The goal isn't to be the most "complex" tool, but the most helpful. It does the heavy lifting in the background so you can just focus on the results.
 
-> ⚠️ **Experimental Tool - Testing Invited!** ⚠️
-> 
-> This started as a personal project for merging Flux Klein models. It *might* work with other formats, but I need your help testing!
+🧪 Proof in the Results: Identity Blending
 
-## 🎯 What This Is
+I tested this by merging characters with very different training backgrounds. By balancing the weights, you can achieve perfect hybrids that keep the identity of both. (workflow included)
 
-A simple ComfyUI node that lets you **experiment with merging two LoRAs** using different methods. It was born from my need to merge Flux Klein 4B models, but I've tried to make it work with other formats too.
+✅ Z-Image (Turbo + Base Mix)
+✅ Flux Klein 9B Character Blends
+✅ SDXL Style + Character Mixes
 
-## 🤔 What This Is NOT
+📦 The Toolbox (Node List)
 
-- **Not** a production-ready, perfect solution
-- **Not** guaranteed to work with all LoRA formats
-- **Not** extensively tested with SD1.5/SDXL (but seems to work)
-- **Not** created by an AI expert (just a hobbyist!)
+• **Easy LoRA Merger**: The main engine. Connect your LoRAs, hit merge, and preview instantly.
+• **Easy LoRA-Only Merger**: Perfect for "chaining" multiple merges or keeping your workspace clean.
+• **🎨 Triple Merger (Experimental)**: Why stop at two? Mix a character, an outfit, and an art style in one node.
+• **🔄 Musubi LoRA Converter**: A specialized bridge for LoRAs trained in the Musubi tuner environment.
+• **🔄 Z-Image Normalizer**: Fixes weight balancing when mixing Z-Image Turbo and Base models.
+• **🔥 Base Model Baker (Experimental)**: The ultimate testing tool. Bakes your merge directly into the model so you can test instantly.
 
-## ✨ What Works (Probably)
+🚧 Status: Beta - Help Wanted!
 
-| Format | Status | Notes |
-|--------|---------|-------|
-| **Flux Klein 4B** | ✅ Tested | The main reason this exists! |
-| **Flux Klein 9B** | ✅ Seems OK | Tested with a few models |
-| **Z-Image Turbo (AI-Toolkit)** | ✅ Seems OK | Tested with a few models |
-| **Pony Diffusion** | ✅ Should work | Recent fix applied |
-| **SD1.5/SDXL Kohya** | ⚠️ Maybe | Not heavily tested |
-| **Z-Image Base** | ❓ Unknown | Different architecture |
-| **LyCORIS/LoCon** | ❓ Untested | Might need adjustments |
+This project works great for my workflows, but I need your help to push it further:
 
-## 🚀 Quick Start
+• **Flux 2 Dev Testing**: Looking for feedback on how these nodes handle the newest Flux models
+• **High-VRAM Users (24GB+)**: Please try "baking" 9B models and let me know how it performs!
+• **SDXL Users**: Test the merger with your favorite style and character mixes
 
-1. **Download** the ZIP or clone:
-   ```bash
-   cd ComfyUI/custom_nodes
-   git clone https://github.com/Terpentinas/EasyLoRAMerger
+📝 Smart Diagnostics
 
-- [Quick Start Guide](Quick_Start_Guide.md)
+I've included a detailed status window in the console. You'll see:
+✅ Green checkmarks when math is aligned
+📊 Layer-by-layer statistics
+⚠️ Clear warnings if something needs attention
 
-![Easy LoRA Merger](https://raw.githubusercontent.com/Terpentinas/EasyLoRAMerger/refs/heads/main/images/node.jpg)
+🚀 Get Started
+
+• **Download**: https://github.com/Terpentinas/EasyLoRAMerger
+• **Workflow**: Drag the attached image into ComfyUI to see my https://github.com/Terpentinas/EasyLoRAMerger/tree/main/workflow
+• **Questions?**: Open an issue on GitHub or comment below!
+
+---
+
+*Built because merging different LoRA formats shouldn't require a PhD in tensor math* 💪

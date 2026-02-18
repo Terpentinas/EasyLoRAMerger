@@ -2214,7 +2214,7 @@ class EasyLoRATripleMerger:
         return (model_lora, clip_lora, str(output_path), lora_tuple)
     
     def _merge_triple_method(self, sds, weights, method, density, uniqueness, threshold, blend):
-        """Core triple merge logic"""
+        """Core triple merge logic with rank adjustment"""
         all_keys = set()
         for sd in sds:
             all_keys.update(sd.keys())
@@ -2222,10 +2222,14 @@ class EasyLoRATripleMerger:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         merged = {}
         
+        # Import rank utilities
+        from .klein_normalizer import safe_get_rank, pad_or_truncate
+        
         for key in all_keys:
             tensors = []
             valid_weights = []
             
+            # Collect tensors that exist in each SD
             for i, sd in enumerate(sds):
                 if key in sd:
                     tensors.append(sd[key].to(device).to(torch.bfloat16))
@@ -2236,13 +2240,33 @@ class EasyLoRATripleMerger:
                     merged[key] = (tensors[0] * valid_weights[0]).cpu()
                 continue
             
-            # Apply method
+            # --- RANK ADJUSTMENT (FIX THE DIMENSION MISMATCH) ---
+            # Get ranks for all tensors
+            ranks = [safe_get_rank(t, key) for t in tensors]
+            target_rank = max(ranks)
+            
+            # Pad/truncate all tensors to same rank
+            adjusted_tensors = []
+            for i, t in enumerate(tensors):
+                if ranks[i] != target_rank:
+                    t = pad_or_truncate(t, target_rank, f"{key}_{i}")
+                adjusted_tensors.append(t)
+            
+            tensors = adjusted_tensors
+            
+            # Apply method with adjusted tensors
             if method == "linear":
                 result = sum(t * w for t, w in zip(tensors, valid_weights))
             
             elif method == "ties_strict":
                 signs = [torch.sign(t * w) for t, w in zip(tensors, valid_weights)]
                 agreement = torch.stack(signs).float().mean(dim=0).abs() > 0.5
+                result = sum(t * w for t, w in zip(tensors, valid_weights)) * agreement
+            
+            elif method == "ties_gentle":
+                # Simple version for triple
+                signs = [torch.sign(t * w) for t, w in zip(tensors, valid_weights)]
+                agreement = torch.stack(signs).float().mean(dim=0).abs() > 0.3
                 result = sum(t * w for t, w in zip(tensors, valid_weights)) * agreement
             
             elif method == "feature_mix":
@@ -2262,25 +2286,15 @@ class EasyLoRATripleMerger:
                 result = selected * blend + averaged * (1 - blend)
             
             elif method == "subtract":
-                # Start with A
                 result = tensors[0] * valid_weights[0]
-                
-                # Subtract B and C
                 for i in range(1, len(tensors)):
                     current = tensors[i] * valid_weights[i]
-                    
                     if threshold > 0:
-                        # Only subtract where current is significant relative to result
                         result_magnitude = result.abs()
                         current_magnitude = current.abs()
-                        
-                        # Create mask where current is significant
                         significant = current_magnitude > (threshold * result_magnitude + 1e-8)
-                        
-                        # Only subtract significant parts
                         result = result - current * significant.float()
                     else:
-                        # Subtract everything
                         result = result - current
             
             elif method == "dare_rescale":
@@ -2292,6 +2306,9 @@ class EasyLoRATripleMerger:
                     results.append(t * mask * rescale * w)
                 result = sum(results)
             
+            else:  # Default to linear
+                result = sum(t * w for t, w in zip(tensors, valid_weights))
+            
             # Apply density if needed
             if density < 1.0 and method not in ["dare_rescale"]:
                 flat = result.abs().flatten()
@@ -2301,6 +2318,9 @@ class EasyLoRATripleMerger:
                 result = result * mask
             
             merged[key] = result.cpu()
+            
+            # Cleanup
+            del tensors
         
         return merged
 
