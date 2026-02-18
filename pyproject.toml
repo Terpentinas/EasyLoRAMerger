@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-easy-lora-merger"
-description = "A simple tool for experimenting with LoRA merging, optimized for Flux Klein 4B/9B. Supports AI-Toolkit, X-Labs, and Kohya formats."
+description = "A versatile LoRA merger for Flux (4B/9B/Dev), Z-Image, and SDXL. Features cross-architecture scaling, weight normalization, and live model baking."
 version = "1.0.0"
 license = {text = "MIT"}
 authors = [
