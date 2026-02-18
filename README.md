@@ -39,7 +39,7 @@ I've included a detailed status window in the console. You'll see:
 🚀 Get Started
 
 • **Download**: https://github.com/Terpentinas/EasyLoRAMerger
-• **Workflow**: Drag the attached image into ComfyUI to see my https://github.com/Terpentinas/EasyLoRAMerger/tree/main/workflow
+• **Workflow**: Drag the attached image into ComfyUI to see my "Identity Hybrid" workflow
 • **Questions?**: Open an issue on GitHub or comment below!
 
 ---
