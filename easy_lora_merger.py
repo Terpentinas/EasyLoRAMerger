@@ -959,6 +959,17 @@ class StreamingMergeEngine:
         Simplified merge function that works with all formats.
         Includes alpha scaling to ensure sliders work correctly.
         """
+        # Reset the printed keys tracker and counters at the start of each merge
+        global _apply_lora_scaling_printed_keys
+        global _apply_lora_scaling_counters
+        _apply_lora_scaling_printed_keys = set()
+        _apply_lora_scaling_counters = {
+            'onetrainer': 0,
+            'alpha_debug': 0,
+            'small_scale': 0,
+            'no_alpha': 0
+        }
+        
         print("🔍 Loading LoRAs with streaming...")
         
         # First, let's load and normalize both models fully
@@ -1132,33 +1143,79 @@ class StreamingMergeEngine:
                     except:
                         continue
             
+            # Calculate rank
+            if len(tensor.shape) >= 2:
+                rank = min(tensor.shape[0], tensor.shape[1])
+            else:
+                rank = 1
+            
+            rank = max(1, rank)
+            
+            # Create a unique ID for this tensor
+            tensor_id = f"{key}_{rank}"
+            
+            # Use the global tracker
+            global _apply_lora_scaling_printed_keys
+            global _apply_lora_scaling_counters
+            
+            # Initialize counters if they don't exist
+            if '_apply_lora_scaling_counters' not in globals():
+                _apply_lora_scaling_counters = {
+                    'onetrainer': 0,
+                    'alpha_debug': 0,
+                    'small_scale': 0,
+                    'no_alpha': 0,
+                    'suppressed': False
+                }
+            
+            MAX_PRINTS = 10  # Maximum number of each message type
+            
             if alpha_value is not None:
                 alpha_value = abs(alpha_value)
                 
-                if len(tensor.shape) >= 2:
-                    rank = min(tensor.shape[0], tensor.shape[1])
-                else:
-                    rank = 1
+                # OneTrainer detection
+                if alpha_value == 1.0 and rank > 1:
+                    if tensor_id not in _apply_lora_scaling_printed_keys:
+                        if _apply_lora_scaling_counters['onetrainer'] < MAX_PRINTS:
+                            print(f"   OneTrainer detected (alpha=1.0, rank={rank}) - treating as converted")
+                            _apply_lora_scaling_counters['onetrainer'] += 1
+                        _apply_lora_scaling_printed_keys.add(tensor_id)
+                    return tensor
                 
-                rank = max(1, rank)
                 scale_factor = alpha_value / rank
                 
-                # Check if this is a converted LoRA (alpha should be baked in)
-                # If scale_factor is very small, it might be incorrectly applied
-                if scale_factor < 0.01 and alpha_value < 1.0:
-                    print(f"⚠️ Very small scale factor {scale_factor:.6f} for {key}")
-                    print(f"   alpha={alpha_value:.4f}, rank={rank}")
-                    print(f"   This LoRA may already be converted - using raw tensor")
-                    return tensor  # Return unscaled for converted LoRAs
+                # Only print debug for first few layers
+                if (tensor_id not in _apply_lora_scaling_printed_keys and 
+                    any(x in key for x in ['layers.0', 'layers.1', 'layers.2'])):
+                    if _apply_lora_scaling_counters['alpha_debug'] < MAX_PRINTS:
+                        print(f"   Alpha debug: {key.split('.')[-3]}.{key.split('.')[-2]}: alpha={alpha_value:.4f}, rank={rank}, scale={scale_factor:.4f}")
+                        _apply_lora_scaling_counters['alpha_debug'] += 1
+                    _apply_lora_scaling_printed_keys.add(tensor_id)
                 
-                # For valid scaling factors, apply
+                # Check for very small scale factors
+                if scale_factor < 0.01 and scale_factor > 0:
+                    if tensor_id not in _apply_lora_scaling_printed_keys:
+                        if _apply_lora_scaling_counters['small_scale'] < MAX_PRINTS:
+                            print(f"⚠️ Very small scale factor {scale_factor:.6f} for {key}")
+                            print(f"   alpha={alpha_value:.4f}, rank={rank}")
+                            print(f"   This LoRA may already be converted - using raw tensor")
+                            _apply_lora_scaling_counters['small_scale'] += 1
+                        _apply_lora_scaling_printed_keys.add(tensor_id)
+                    return tensor
+                
                 if scale_factor > 0.01:
                     return tensor * scale_factor
                 else:
-                    # Too small, probably shouldn't scale
                     return tensor
             
-            # No alpha found - this is a converted LoRA
+            # No alpha found
+            if tensor_id not in _apply_lora_scaling_printed_keys:
+                if any(x in key for x in ['layers.0', 'layers.1', 'layers.2']):
+                    if _apply_lora_scaling_counters['no_alpha'] < MAX_PRINTS:
+                        print(f"   No alpha for {key.split('.')[-3]}.{key.split('.')[-2]}, using unscaled")
+                        _apply_lora_scaling_counters['no_alpha'] += 1
+                _apply_lora_scaling_printed_keys.add(tensor_id)
+            
             return tensor
         
         
