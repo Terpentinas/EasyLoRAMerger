@@ -73,6 +73,7 @@ class MergeConfig:
     uniqueness: float = 0.7      # For feature_mix
     threshold: float = 0.0       # For subtract
     blend: float = 0.5           # For magnitude
+    blend_mode: str = "auto"  # "auto", "balanced", "dense", "fun_mode"
     
     @classmethod
     def from_inputs(cls, **kwargs) -> 'MergeConfig':
@@ -1296,13 +1297,39 @@ class StreamingMergeEngine:
                     
                     # --- END DEBUG INFO ---
                     
+                    # After scaling and rank adjustment, before creating method_args
+                    if self.config.blend_mode == "auto":
+                        # Calculate sparsity (percentage of zeros)
+                        sparsity_a = (t_a == 0).float().mean().item()
+                        sparsity_b = (t_b == 0).float().mean().item()
+                        
+                        print(f"   Sparsity: A={1-sparsity_a:.1%} active, B={1-sparsity_b:.1%} active")
+                        
+                        # If sparsity differs significantly, use active blending
+                        if abs(sparsity_a - sparsity_b) > 0.2:  # 20% difference threshold
+                            active_mode = "active"
+                            #print(f"   🔄 Auto blend: detected different sparsity patterns ({sparsity_a:.1%} vs {sparsity_b:.1%})")
+                        else:
+                            active_mode = "standard"
+                            #print(f"   🔄 Auto blend: similar sparsity patterns ({sparsity_a:.1%} vs {sparsity_b:.1%})")
+                    else:
+                        # Map user selection to internal mode
+                        mode_map = {
+                            "balanced": "active",
+                            "dense": "standard", 
+                            "fun_mode": "crazy_mode"
+                        }
+                        active_mode = mode_map.get(self.config.blend_mode, "active")
+                    
                     # Get merge method
                     merge_func = MergeMethodRegistry.get_method(self.config.method)
                     
                     # Prepare arguments with SCALED tensors
                     method_args = {
                         'a': t_a, 'b': t_b, 
-                        'wa': self.config.weight_a, 'wb': self.config.weight_b
+                        'wa': self.config.weight_a, 
+                        'wb': self.config.weight_b,
+                        'blend_mode': active_mode  # ← Use the variable
                     }
                     
                     # Add method-specific parameters from self.config
@@ -1685,6 +1712,10 @@ class EasyLoRAmergerNode:
                                        "tooltip": "Tensors per batch (lower = less VRAM)"}),
                 "streaming": ("BOOLEAN", {"default": True,
                                          "tooltip": "Stream tensors to save VRAM"}),
+                "blend_mode": (["auto", "balanced", "dense", "fun_mode"], {
+                    "default": "auto",
+                    "tooltip": "auto: Smart choice based on LoRAs | balanced: Preserve patterns | dense: Traditional mix | fun_mode: math a bit incorrect"
+                }),
                 # METHOD INFO DISPLAY (read-only)
                 "method_info": ("STRING", {
                     "default": "Select a method to see details here...", 
@@ -1704,7 +1735,7 @@ class EasyLoRAmergerNode:
     @classmethod
     def IS_CHANGED(cls, **kwargs):
         """Cache implementation for ComfyUI change detection."""
-        # Create cache key from relevant inputs
+        # Create cache key from relevant inputs - MUST match merge() parameters
         cache_key = (
             kwargs.get('lora_a', 'None'),
             kwargs.get('lora_b', 'None'),
@@ -1714,6 +1745,14 @@ class EasyLoRAmergerNode:
             kwargs.get('density', 1.0),
             kwargs.get('save_trigger', False),
             kwargs.get('streaming', True),
+            kwargs.get('uniqueness', 0.7),        # Used by merge_feature_mix
+            kwargs.get('threshold', 0.0),          # Used by merge_subtract, merge_ties_gentle
+            kwargs.get('blend', 0.5),              # Used by merge_magnitude
+            kwargs.get('blend_mode', 'auto'),      # Affects all merges
+            kwargs.get('precision', 'auto'),       # Affects computation
+            kwargs.get('device', 'auto'),          # Affects computation
+            kwargs.get('batch_size', 32),          # Affects streaming
+            kwargs.get('metadata_mode', 'merge_basic'),  # Affects output metadata
         )
         
         # Generate hash
@@ -1735,6 +1774,7 @@ class EasyLoRAmergerNode:
               save_trigger=False, save_folder="", filename="merged_lora",
               device="auto", precision="auto", metadata_mode="merge_basic",
               batch_size=32, streaming=True,
+              blend_mode="auto",
               method_info=None):
         
         print("\n" + "="*50)
@@ -1752,6 +1792,7 @@ class EasyLoRAmergerNode:
             blend=blend,
             device_type=device,
             precision=precision,
+            blend_mode=blend_mode,
             metadata_mode=metadata_mode,
             batch_size=batch_size,
             streaming=streaming
@@ -1973,6 +2014,10 @@ class EasyLoRAonlyMerger:
                                        "tooltip": "Tensors per batch (lower = less VRAM)"}),
                 "streaming": ("BOOLEAN", {"default": True,
                                          "tooltip": "Stream tensors to save VRAM"}),
+                "blend_mode": (["auto", "balanced", "dense", "fun_mode"], {
+                    "default": "auto",
+                    "tooltip": "auto: Smart choice based on LoRAs | balanced: Preserve patterns | dense: Traditional mix | fun_mode: math a bit incorrect"
+                }),
                 # METHOD INFO DISPLAY (read-only)
                 "method_info": ("STRING", {
                     "default": "Select a method to see details here...", 
@@ -1997,7 +2042,7 @@ class EasyLoRAonlyMerger:
                    uniqueness=0.7, threshold=0.0, blend=0.5,
                    save_trigger=False, save_folder="", filename="merged_lora",
                    device="auto", precision="auto", metadata_mode="merge_basic",
-                   batch_size=32, streaming=True,
+                   batch_size=32, streaming=True, blend_mode="auto",
                    method_info=None, node_id=None):
         
         print("\n" + "="*50)
@@ -2013,9 +2058,9 @@ class EasyLoRAonlyMerger:
             uniqueness=uniqueness,
             threshold=threshold,
             blend=blend,
-            # REMOVED: attn_weight, mlp_weight, confidence_a, confidence_b
             device_type=device,
             precision=precision,
+            blend_mode=blend_mode,
             metadata_mode=metadata_mode,
             batch_size=batch_size,
             streaming=streaming
@@ -2155,6 +2200,10 @@ class EasyLoRATripleMerger:
                 "device": (["auto", "cuda", "cpu"], {"default": "auto"}),
                 "precision": (["auto", "float32", "bfloat16", "float16"], {"default": "auto"}),
                 "batch_size": ("INT", {"default": 32, "min": 1, "max": 256, "step": 8}),
+                "blend_mode": (["auto", "balanced", "dense", "fun_mode"], {
+                    "default": "auto",
+                    "tooltip": "auto: Smart choice based on LoRAs | balanced: Preserve patterns | dense: Traditional mix | fun_mode: math a bit incorrect"
+                }),
                 "method_info": ("STRING", {
                     "default": "Select a method to see details...", 
                     "multiline": True, 
@@ -2172,7 +2221,7 @@ class EasyLoRATripleMerger:
                     lora_a="None", lora_b="None", lora_c="None",
                     lora_data_a=None, lora_data_b=None, lora_data_c=None,
                     weight_a=1.0, weight_b=1.0, weight_c=1.0,
-                    uniqueness=0.7, threshold=0.0, blend=0.5,
+                    uniqueness=0.7, threshold=0.0, blend=0.5, blend_mode="auto",
                     save_trigger=False, save_folder="", filename="triple_merged",
                     device="auto", precision="auto", batch_size=32,
                     method_info=None):
@@ -2190,6 +2239,7 @@ class EasyLoRATripleMerger:
             uniqueness=uniqueness,
             threshold=threshold,
             blend=blend,
+            blend_mode=blend_mode,
             device_type=device,
             precision=precision,
             batch_size=batch_size,
@@ -2244,7 +2294,7 @@ class EasyLoRATripleMerger:
         merged_dict = self._merge_triple_method(
             normalized_sds, 
             [weight_a, weight_b, weight_c],
-            method, density, uniqueness, threshold, blend
+            method, density, uniqueness, threshold, blend, blend_mode=blend_mode 
         )
         
         # Finalize and save
@@ -2270,7 +2320,7 @@ class EasyLoRATripleMerger:
         
         return (model_lora, clip_lora, str(output_path), lora_tuple)
     
-    def _merge_triple_method(self, sds, weights, method, density, uniqueness, threshold, blend):
+    def _merge_triple_method(self, sds, weights, method, density, uniqueness, threshold, blend, blend_mode="auto"):
         """Core triple merge logic with rank adjustment"""
         all_keys = set()
         for sd in sds:
