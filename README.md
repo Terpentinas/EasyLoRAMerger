@@ -1,136 +1,96 @@
-# 🛠️ Easy LoRA Merger  
-*Complexity Made Simple*
+# 🛠️ Easy LoRA Merger Suite
+*Complexity Made Simple — Merge Anything*
 
-Models are evolving fast — between Z-Image, Klein 4B/9B, Flux 2 Dev, and SDXL, it's a lot to keep track of.  
-This suite of nodes lets you merge different architectures without worrying about tensor dimensions, sparsity mismatches, or scaling math.
+The Easy LoRA Merger Suite gives you a complete toolkit to merge, convert, extract, bake, and
+audit LoRAs and checkpoints — without worrying about tensor dimensions, sparsity mismatches,
+or arcane scaling math.
 
-The goal isn’t to be the most complex tool — it’s to be the most helpful.
-
----
-
-# 🔍 Example Workflow
-
-This is the basic "Identity Hybrid" setup used in the examples below.
-
-![Basic Workflow](workflow/workflow-zit.png)
-
-> Drag the workflow image into ComfyUI to load it instantly.
+Every node is built with the same philosophy: **powerful defaults when you need simplicity,
+full control when you need precision.**
 
 ---
 
-# 🧠 Main Node Interface
+# 🔍 All Nodes at a Glance
 
-The core node with blend modes, diagnostics, and merge methods.
+![All Nodes Overview](assets/nodes.png)
 
-![Main Node UI](assets/main_node.png)
-
-Includes:
-- Blend mode selection
-- Advanced merge methods
-- Fun Mode toggles
-- Layer-by-layer diagnostics
-- Compatibility checks
+> The complete node suite — drag, connect, and merge.
 
 ---
 
-# 🧪 Identity Blending Example
+# 📦 Node Catalog
 
-### Source LoRAs
-
-| LoRA A | LoRA B |
-|--------|--------|
-| ![LoRA A Example](assets/lora1.png) | ![LoRA B Example](assets/lora2.png) |
-
-### Merged Result
-
-![Merged Result](workflow/z-image-updated.png)
-
-By carefully balancing weights, both identities remain visible without overpowering each other.
-
-Tested With:
-- ✅ Z-Image (Turbo + Base Mix)
-- ✅ Flux Klein 9B Character Blends
-- ✅ SDXL Style + Character Mixes
+| Node | Display Name | Purpose |
+|------|-------------|---------|
+| 🎨 | **Easy LoRA Merger** | Merge 2–3 LoRAs with 15+ methods, auto‑format detection, smart defaults, and forensic reports. The core workhorse. |
+| 🛡️ | **Easy LoRA Studio** | Universal LoRA analyzer and converter. Transforms between Standard WebUI, Comfy Native, and Forge‑Optimized formats. SVD compression, TE scaling, weight adjustment. |
+| 🛡️ | **Easy Checkpoint Studio** | Precision surgery for full checkpoints — precision casting FP8/BF16/FP32, component stripping VAE/TE/CLIP, SVD compression, and structural remapping. |
+| 🎨 | **Easy Checkpoint Merger** | Merge 2–3 full model checkpoints with Weight Block Map component‑wise scaling. Streaming engine for low RAM usage. |
+| 🔬 | **Easy LoRA Extractor** | Extract a LoRA from the delta between a base and fine‑tuned checkpoint. SVD decomposition with auto‑energy rank selection. |
+| 🔥 | **Easy LoRA Baker** | Bake a LoRA (or merged LoRA) directly into a full checkpoint at the tensor level. Produces MODEL+CLIP+VAE with RAM Guard fallback. |
 
 ---
 
-# 🎮 Blend Modes
+# 🎯 Merge Methods
 
-| Mode | Description |
-|------|-------------|
-| **auto** | Smart selection based on sparsity patterns |
-| **balanced** | Preserves unique activation structure (great for mixed trainers) |
-| **dense** | Traditional dense tensor blending |
-| **fun_mode** | Experimental math for creative effects |
+| Method | Best for | Works on Checkpoints? |
+|--------|----------|:---------------------:|
+| **linear** | Simple weighted average — the safe starting point for any merge | ✅ Yes |
+| **cross** | Blending with a cross‑magnitude interaction term for richer mixes | ✅ Yes |
+| **ties_strict** | Conflicting styles — only keeps weights where both sources agree | ⚠️ Limited (all-positive weights reduce effect) |
+| **ties_gentle** | Softer version of TIES — applies only to strong disagreements | ⚠️ Limited (all-positive weights reduce effect) |
+| **ties_contrast** | Amplify differences between two sources, mute agreements | ⚠️ Limited (best on LoRA deltas) |
+| **dare_lite** | Random dropout — creates sparse, stochastic blends | ❌ LoRA only (risky on checkpoint weights) |
+| **dare_rescale** | Random dropout with rescaling — preserves magnitude distribution | ❌ LoRA only (risky on checkpoint weights) |
+| **magnitude** | Keep the stronger signal per-element from either source | ✅ Yes |
+| **subtract** | Remove unwanted features by subtracting one source from another | ✅ Yes |
+| **feature_mix** | Preserve unique features from each source — great for style + character | ✅ Yes |
+| **slerp** | Smooth spherical interpolation between two vectors | ✅ Yes (2‑way only) |
+| **svd_preserve** | SVD‑based rank reduction — keeps core structure while reducing noise | ✅ Yes |
+| **block_swap** | Swap blocks between sources using a seeded random pattern | ✅ Yes |
+| **noise_aware** | Suppress small noise values before merging for cleaner results | ✅ Yes |
+| **gradient_alignment** | Weight contributions by directional similarity between sources | ✅ Yes |
 
----
-
-## 🎲 Fun Mode Effects by Method
-
-| Method | Fun Mode Effect |
-|--------|-----------------|
-| magnitude | "chaos mode" – Random weighted selection |
-| subtract | "glitch mode" – Random add/subtract behavior |
-| dare_lite | "gambler mode" – Random amplification |
-| ties_strict | "disagreement mode" – Keeps opposing tensor signs |
-| ties_gentle | "drama mode" – Amplifies disagreements |
-| dare_rescale | "lottery mode" – Random jackpot scaling |
-| svd_preserve | "patchwork mode" – Block-based swapping |
-| noise_aware | "static mode" – Structured noise injection |
-| gradient_alignment | "mood swing mode" – Random alignment bias |
+> 💡 **Tip:** When in doubt, start with `linear` or `magnitude` — they're the most versatile and work well across LoRAs and checkpoints alike.
 
 ---
 
-# 📦 Node Toolbox
+# 🧠 Smart Diagnostics
 
-- **Easy LoRA Merger** — Main engine for merging and previewing
-- **Easy LoRA-Only Merger** — Clean chaining of multiple merges
-- **🎨 Triple Merger (Experimental)** — Character + outfit + style in one pass
-- **🔄 Musubi LoRA Converter** — Compatibility bridge for Musubi-trained LoRAs
-- **🔄 Z-Image Normalizer** — Fix weight imbalance between Turbo and Base
-- **🔥 Base Model Baker (Experimental)** — Bake merged LoRA directly into model
+Every merge node outputs a detailed forensic report with:
 
----
+- ✅ **Alignment verification** — cross‑architecture key matching stats
+- 📊 **Layer‑by‑layer statistics** — energy distribution, sparsity, component breakdown
+- ⚠️ **Clear warnings** — mismatched trainers, conflicting trigger words, density risks
+- 🔍 **Sparsity + scaling reports** — magnitude distribution per layer
 
-# 📝 Smart Diagnostics
-
-![Log view](assets/log.jpg)
-
-Console output includes:
-
-- ✅ Alignment verification
-- 📊 Layer-by-layer statistics
-- ⚠️ Clear warnings for mismatches
-- 🔍 Sparsity + scaling reports
+Console output keeps you informed at every step without overwhelming.
 
 ---
 
-# 🧪 Resources Used in Examples
+# 🏗️ Supported Architectures (aspirational — not all fully tested)
 
-These are the LoRAs used in the demonstration images above.
-
-- **Jinx Arcane (Z-Image Turbo)** by Tekemo — [https://civitai.com/models/2198444/jinx-arcane-z-image-turbo-lora?modelVersionId=2475322]
-- **Izzy AI Character (Flux 2)** by berts_eyebrow — [https://civitai.com/models/2194957/izzy-ai-character-flux2-9b-qwen-2512-z-image-xl-wan?modelVersionId=2650293]
-
----
-
-# 🚧 Beta Status – Feedback Wanted
-
-Looking for:
-
-- **Flux 2 Dev testers**
-- **24GB+ VRAM users** to test baking 9B models
-- **SDXL users** to try style + character merges
+| Architecture | Status |
+|-------------|--------|
+| Flux.1‑Dev / Flux.1‑S | Tested |
+| Flux Klein 4B / 9B | Tested |
+| Z‑Image Turbo / Base | Tested |
+| SDXL | Tested |
+| SD1.5 | Tested |
+| Anima | Early support |
+| Lumina 2 | Early support |
+| SD3 | Experimental |
 
 ---
 
 # 🚀 Get Started
 
-- Download: https://github.com/Terpentinas/EasyLoRAMerger
-- Load workflow into ComfyUI
-- Experiment with blend modes
-- Open an issue for feedback
+- **Download:** [github.com/Terpentinas/EasyLoRAMerger](https://github.com/Terpentinas/EasyLoRAMerger)
+- **Install:** Drop into `ComfyUI/custom_nodes/` and restart ComfyUI.
+- **Explore:** Drag [`assets/nodes.png`](assets/nodes.png) into the workflow area to see the suite in action.
+- **Experiment:** Connect a *Easy LoRA Merger* → *Easy LoRA Baker* pipeline, or use *Easy Checkpoint Studio* to shrink a 12GB checkpoint to FP8.
+- **Feedback:** Open an issue on GitHub — contributions and ideas welcome.
 
 ---
 
-*Built because merging different LoRA formats shouldn’t require a PhD in tensor math.* 💪
+*Built because merging different model formats shouldn't require a PhD in tensor math.* 💪
