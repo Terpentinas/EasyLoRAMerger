@@ -5,12 +5,12 @@ Handles three source checkpoint files (.safetensors) and merges them with low RA
 
 import json
 import gc
-import io
 import time
 import sys
-import tempfile
 import uuid
 import os
+
+import folder_paths
 
 # Debug flag for verbose diagnostic logging during checkpoint weave operations.
 # Set WEAVER_DEBUG=1 environment variable to enable detailed per-batch diagnostics.
@@ -44,11 +44,16 @@ from .checkpoint_normalizer import (
     normalize_checkpoint_header,
 )
 from .forensics import build_forensic_report
+from .fp8_quantizer import (
+    should_preserve_bf16,
+    quantize_weight_to_fp8_with_scales_optimized as quantize_weight_to_fp8_with_scales,
+    dequant_fp8_tensor,
+)
 
 
-class CheckpointTripleStreamWriter:
+class CheckpointTripleMerger:
     """
-    Two‑pass incremental writer that merges three checkpoints on the fly.
+    Two‑pass incremental merger that merges three checkpoints on the fly.
     Accepts either file paths (source_paths) or in-memory state dicts
     (source_dicts) as source inputs. When source_dicts[i] is provided,
     the corresponding source_paths[i] is ignored.
@@ -138,7 +143,7 @@ class CheckpointTripleStreamWriter:
             with safe_open(filepath, framework="pt") as sf:
                 metadata = sf.metadata() or {}
                 # Use class-level aliased reverse map (includes torch aliases + string self-mappings)
-                dtype_reverse = CheckpointTripleStreamWriter.DTYPE_REVERSE_ALIASES
+                dtype_reverse = CheckpointTripleMerger.DTYPE_REVERSE_ALIASES
                 for key in sf.keys():
                     slice_info = sf.get_slice(key)
                     dtype = slice_info.get_dtype()
@@ -182,7 +187,7 @@ class CheckpointTripleStreamWriter:
         just to read its header back.
         """
         tensors = {}
-        dtype_reverse = CheckpointTripleStreamWriter.DTYPE_REVERSE_ALIASES
+        dtype_reverse = CheckpointTripleMerger.DTYPE_REVERSE_ALIASES
         for key, tensor in state_dict.items():
             dtype_str = dtype_reverse.get(tensor.dtype, "F32")
             tensors[key] = {
@@ -222,7 +227,7 @@ class CheckpointTripleStreamWriter:
         tensors, metadata = load_checkpoint_with_metadata(filepath, categorize=False)
         
         # Create temporary safetensors file
-        temp_dir = Path(tempfile.gettempdir()) / "easy_checkpoint_merger"
+        temp_dir = Path(folder_paths.get_temp_directory()) / "easy_checkpoint_merger"
         temp_dir.mkdir(parents=True, exist_ok=True)
         unique = uuid.uuid4().hex[:8]
         temp_path = temp_dir / f"converted_{unique}_{filepath.stem}.safetensors"
@@ -250,11 +255,10 @@ class CheckpointTripleStreamWriter:
                  output_path: Path,
                  merge_config: Dict[str, Any],
                  metadata_options: Optional[Dict[str, Any]] = None,
-                 use_buffer: bool = False,
                  use_dict: bool = False,
                  source_dicts: Optional[List[Optional[Dict[str, torch.Tensor]]]] = None):
         """
-        Initialize the triple stream writer.
+        Initialize the triple merger.
         
         Args:
             source_paths: List of checkpoint file paths (fewer than three allowed).
@@ -298,11 +302,7 @@ class CheckpointTripleStreamWriter:
         self.output_path = Path(output_path) if output_path is not None else None
         self.merge_config = merge_config
         self.metadata_options = metadata_options or {}
-        self.use_buffer = use_buffer
         self.use_dict = use_dict
-        if use_buffer and use_dict:
-            raise ValueError("use_buffer and use_dict are mutually exclusive")
-        self._output_buffer: Optional[io.BytesIO] = None
         self._output_dict: Optional[Dict[str, torch.Tensor]] = None
         # Resolve device and precision once via unified config
         device_str = merge_config.get('device', 'auto')
@@ -329,6 +329,16 @@ class CheckpointTripleStreamWriter:
         self.component_counts = {"unet": 0, "clip": 0, "vae": 0, "te": 0, "other": 0}
         self.parameter_counts = {"unet": 0, "clip": 0, "vae": 0, "te": 0, "other": 0}
         self.architecture = "Unknown"
+        # FP8 companion scales dict: norm_key → (weight_scale_tensor, input_scale_tensor)
+        # Populated during weave() when quantizing weights to FP8, used to write
+        # companion scale tensor entries alongside FP8-quantized weights.
+        self._companion_scales: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        # Companion scale tensor slots emitted by survey() for FP8 output.
+        # Stored separately from tensor_list so they don't inflate batch counting.
+        self.companion_list: List[Dict[str, Any]] = []
+        # OOM safety flag: set to True after first CUDA OOM, causing remaining
+        # batches to process on CPU instead of GPU.
+        self._oom_cpu_fallback = False
 
         # Map torch dtype to safetensors dtype string
         self.target_dtype_str = self.DTYPE_REVERSE.get(self.target_dtype, "F32")
@@ -348,21 +358,28 @@ class CheckpointTripleStreamWriter:
         # Sample keys to show what we're detecting
         sample_keys = list(header.keys())[:5]
         has_lora = any('lora_' in k for k in header.keys())
-        print(f"[_normalize_header] Checking {len(header)} keys, has 'lora_' pattern: {has_lora}, sample keys: {sample_keys}")
+        if _WEAVER_DEBUG:
+            print(f"[_normalize_header] Checking {len(header)} keys, has 'lora_' pattern: {has_lora}, sample keys: {sample_keys}")
         
         if not has_lora:
             # Full checkpoint: use architecture-aware normalization
             architecture = detect_checkpoint_architecture(list(header.keys()))
-            print(f"[_normalize_header] Architecture: {architecture}, normalizing {len(header)} keys")
+            # Keep one concise line per source even in non-debug mode
+            if not _WEAVER_DEBUG:
+                print(f"[_normalize_header] {len(header)} keys, architecture: {architecture}")
+            else:
+                print(f"[_normalize_header] Architecture: {architecture}, normalizing {len(header)} keys")
             
             # Normalize keys to canonical form (e.g., strip model.diffusion_model. prefix for FLUX)
             normalized_header, mapping = normalize_checkpoint_header(header, architecture)
             
-            print(f"[_normalize_header] Normalized {len(header)} keys -> {len(normalized_header)} canonical keys")
+            if _WEAVER_DEBUG:
+                print(f"[_normalize_header] Normalized {len(header)} keys -> {len(normalized_header)} canonical keys")
             return normalized_header, mapping
         
         # LoRA detected - proceed with identity normalization
-        print(f"[_normalize_header] LoRA: {len(header)} keys, running identity_normalize")
+        if _WEAVER_DEBUG:
+            print(f"[_normalize_header] LoRA: {len(header)} keys, running identity_normalize")
         # Build dummy state dict with keys only (identity_normalize uses keys, not values)
         dummy_sd = {key: torch.zeros(1, dtype=torch.float32) for key in header}
         # Normalize with identity mapping
@@ -382,11 +399,22 @@ class CheckpointTripleStreamWriter:
         determine output tensor sizes and offsets, build output header.
         Returns (header_dict, total_parameters, component_counts).
 
+        If called a second time (e.g. RAM guard then weave), cached results
+        are returned immediately — no redundant header I/O.
+
         Args:
             pbar: ProgressTracker to advance after each source processed.
                   Defaults to NullProgressTracker (silent no-op).
                   Stateless singleton — safe as default parameter.
         """
+        # ── Cache guard: skip if already surveyed ──
+        if self.tensor_list:
+            return self.header, self.total_parameters, self.component_counts
+
+        _survey_t0 = time.time()
+        print(f"   🕐 [t={_survey_t0 - time.time():.1f}s] survey: reading {len(self.source_paths)} source headers")
+        # Re-fetch current time for accurate relative offset
+        _survey_t0 = time.time()
         self.headers = []
         self.metadatas = []
         self.normalized_headers = []
@@ -414,6 +442,7 @@ class CheckpointTripleStreamWriter:
             norm_keys_per_source.append(norm_keys)
         
             pbar.update(1)
+        print(f"   🕐 [t={time.time()-_survey_t0:.1f}s] survey: headers read ({len(self.union_keys)} union keys before filtering)")
         
         # Log integer tensor counts per source
         for i, nh in enumerate(self.normalized_headers):
@@ -428,28 +457,31 @@ class CheckpointTripleStreamWriter:
             self.common_keys = []
         self.union_keys = sorted(set.union(*norm_keys_per_source) if norm_keys_per_source else set())
         
-        # ── Filter out FP8 quantization scale keys ────────────────────────
-        # These keys (*.input_scale, *.weight_scale) are PyTorch FP8
-        # quantization metadata, not actual model weights.  They appear in
-        # FP8-quantized safetensors files (e.g. float8_e4m3fn) alongside
-        # regular weight tensors.  Including them in the merge:
+        # ── Filter out FP8 quantization artifact keys ─────────────────────
+        # These keys (*.input_scale, *.weight_scale, *.comfy_quant) are FP8
+        # / INT8 quantization metadata, not actual model weights. They appear
+        # in quantized safetensors files alongside regular weight tensors:
+        #   - .input_scale / .weight_scale  — companion scale factors
+        #   - .comfy_quant                  — ComfyUI quantisation metadata
+        # Including them in the merge:
         #   (a) inflates the union with keys present in only one source,
         #   (b) gets them averaged/corrupted like regular tensors,
-        #   (c) causes ComfyUI to log "unexpected" keys and ignore them.
+        #   (c) causes ComfyUI to detect "quantization metadata" and enter
+        #       the MixedPrecisionOps code path, but the actual weights are
+        #       BF16 (dequantized during merge) — model loading fails.
         # This is safe for ALL architectures (Flux, SDXL, SD1.5, Z-Image,
-        # Anima, Lumina2) — none use `.input_scale` / `.weight_scale` as
-        # actual parameter names; these suffixes are exclusively FP8
-        # quantization artifacts from torch.ao.quantization.
-        _FP8_SCALE_SUFFIXES = ('.input_scale', '.weight_scale')
+        # Anima, Lumina2) — none use these suffixes as actual parameter names.
+        # The GGUF writer (gguf_writer.py:203) already uses the same triple.
+        _FP8_ARTIFACT_SUFFIXES = ('.input_scale', '.weight_scale', '.comfy_quant')
         filtered = []
         removed = 0
         for nk in self.union_keys:
-            if nk.endswith(_FP8_SCALE_SUFFIXES):
+            if nk.endswith(_FP8_ARTIFACT_SUFFIXES):
                 removed += 1
             else:
                 filtered.append(nk)
         if removed:
-            print(f"   ⏭️ Excluded {removed} FP8 quantization scale keys from merge")
+            print(f"   ⏭️ Excluded {removed} FP8/INT8 quantization artifact keys from merge")
         self.union_keys = filtered
         
         print(f"[WEAVE] Union: {len(self.union_keys)} unique keys across sources")
@@ -465,12 +497,28 @@ class CheckpointTripleStreamWriter:
         # Scrub based on keep_metadata flag, then sign with checkpoint_studio preset
         mode = "preserve_a" if self.metadata_options.get('keep_metadata', True) else "none"
         scrubbed = scrub_metadata(merged_metadata, mode)
+
+        # Strip _quantization_metadata ONLY when output dtype is NOT FP8.
+        #
+        # When the merge target is BF16/FP16/FP32, the merger dequantizes
+        # FP8 sources and produces float output — no quantization metadata
+        # should propagate (would trigger MixedPrecisionOps incorrectly).
+        #
+        # When target IS FP8, the output IS a quantized checkpoint and
+        # needs _quantization_metadata so ComfyUI's load_state_dict_guess_config
+        # can enter MixedPrecisionOps for proper dequant during inference.
+        # The companion scale tensors (.weight_scale, .input_scale) are
+        # emitted by survey() at lines 575-609 and populated by weave().
+        if self.target_dtype_str not in ("F8_E4M3", "F8_E5M2"):
+            scrubbed.pop('_quantization_metadata', None)
+
         self.merged_metadata = scrubbed
         
         # Determine output shape/dtype per key (use first source where key exists)
         # For simplicity, assume all sources have same shape for common keys (no validation).
         # We'll pick shape from first source that contains the key.
         self.tensor_list = []
+        self.companion_list = []
         self.total_parameters = 0
         self.component_counts = {k: 0 for k in self.component_counts}
         self.parameter_counts = {k: 0 for k in self.parameter_counts}
@@ -533,6 +581,42 @@ class CheckpointTripleStreamWriter:
                 "pad_after": pad_after,
                 "sources": sources,
             })
+
+            # ── FP8: emit companion scale tensor slots for weight keys ──
+            if output_dtype_str in ("F8_E4M3", "F8_E5M2") and norm_key.endswith('.weight'):
+                if not should_preserve_bf16(norm_key):
+                    # .weight_scale companion (scalar F32, 4 bytes)
+                    weight_scale_key = orig_key + "_scale"
+                    self.companion_list.append({
+                        "norm_key": norm_key + "_scale",
+                        "orig_keys": [None] * len(self.source_paths),
+                        "key": weight_scale_key,
+                        "shape": [1],
+                        "dtype": "F32",
+                        "size": 4,
+                        "offset": None,
+                        "pad_after": 0,
+                        "sources": [],
+                        "_companion": True,
+                        "_parent_norm_key": norm_key,
+                        "_scale_type": "weight_scale",
+                    })
+                    # .input_scale companion (scalar F32, 4 bytes)
+                    input_scale_key = orig_key.replace('.weight', '.input_scale')
+                    self.companion_list.append({
+                        "norm_key": norm_key.replace('.weight', '.input_scale'),
+                        "orig_keys": [None] * len(self.source_paths),
+                        "key": input_scale_key,
+                        "shape": [1],
+                        "dtype": "F32",
+                        "size": 4,
+                        "offset": None,
+                        "pad_after": 0,
+                        "sources": [],
+                        "_companion": True,
+                        "_parent_norm_key": norm_key,
+                        "_scale_type": "input_scale",
+                    })
         # Architecture detection (using centralized, extensible detection)
         # Use normalized keys from all sources for accurate detection
         all_normalized_keys = []
@@ -565,8 +649,15 @@ class CheckpointTripleStreamWriter:
         
         
         # Build placeholder header with dummy offsets (0)
+        # Include both weight tensor_list and companion scale items.
         header = {}
         for item in self.tensor_list:
+            header[item['key']] = {
+                "dtype": item['dtype'],
+                "shape": list(item['shape']),
+                "data_offsets": [0, item['size']]  # placeholder
+            }
+        for item in self.companion_list:
             header[item['key']] = {
                 "dtype": item['dtype'],
                 "shape": list(item['shape']),
@@ -597,7 +688,9 @@ class CheckpointTripleStreamWriter:
         self.header_len_padded = header_len_padded
         self.data_start = data_start
         
-        print(f"[WEAVE] Header boundary: {header_len_padded} bytes, data start = {data_start}, {len(self.tensor_list)} tensors")
+        total_slots = len(self.tensor_list) + len(self.companion_list)
+        print(f"[WEAVE] Header boundary: {header_len_padded} bytes, data start = {data_start}, {total_slots} tensors ({len(self.tensor_list)} weights, {len(self.companion_list)} companions)")
+        print(f"   🕐 [t={time.time()-_survey_t0:.1f}s] survey complete ({total_slots} tensor slots)")
         
         return header, self.total_parameters, self.component_counts
     
@@ -618,13 +711,10 @@ class CheckpointTripleStreamWriter:
         if not hasattr(self, 'header_json'):
             raise RuntimeError('Survey must be called before weave')
         
-        # Determine output target: direct dict, BytesIO (RAM), or file (disk)
+        # Determine output target: direct dict or file (disk)
         if self.use_dict:
             out_f = None
             print(f"🧠 Direct dict mode – storing merged tensors in dict")
-        elif self.use_buffer:
-            out_f = io.BytesIO()
-            print(f"🧠 RAM mode – weaving into BytesIO buffer")
         else:
             out_f = open(self.output_path, 'wb', buffering=0)
         
@@ -695,6 +785,8 @@ class CheckpointTripleStreamWriter:
             # pbar is always a valid object (NullProgressTracker by default).
             # No internal fallback tracker needed — merge_triple_method handles
             # substep progress via on_substep callback.
+            _weave_t0 = time.time()
+            print(f"   🕐 [t={0.0:.1f}s] weave: starting {num_batches} batches (batch_size={effective_batch_size})")
             
             for batch_start in range(0, total_items, effective_batch_size):
                 # Open source files fresh for THIS batch only, then wrap in try/finally
@@ -703,7 +795,7 @@ class CheckpointTripleStreamWriter:
                 for i, src_path in enumerate(self.source_paths):
                     if self.source_dicts[i] is not None:
                         # In-memory dict: wrap with _DictMapping instead of _LazyCheckpointMapping
-                        mapping = CheckpointTripleStreamWriter._DictMapping(self.source_dicts[i])
+                        mapping = CheckpointTripleMerger._DictMapping(self.source_dicts[i])
                     else:
                         mapping = _LazyCheckpointMapping(src_path)
                     batch_sources.append(mapping)
@@ -747,15 +839,8 @@ class CheckpointTripleStreamWriter:
                             # which was the root cause of "noise instead of image" in
                             # the FP8 merge workflow.
                             if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-                                scale_key = orig_key + '_scale'
-                                try:
-                                    scale_tensor = batch_sources[idx][scale_key]
-                                    # Dequantize: actual_weight = FP8_value × scale
-                                    tensor = tensor.to(dtype=torch.float32)
-                                    scale_tensor = scale_tensor.to(dtype=torch.float32)
-                                    tensor = tensor * scale_tensor
-                                except KeyError:
-                                    pass  # No scale key available — proceed with raw cast
+                                # Dequant FP8 → float32 using companion scale factors
+                                tensor = dequant_fp8_tensor(tensor, orig_key, torch.float32, batch_sources[idx])
 
                             # If the storage dtype is FP8, use bfloat16 for compute
                             # (merge arithmetic cannot run on Float8 CUDA tensors).
@@ -767,7 +852,12 @@ class CheckpointTripleStreamWriter:
                                     tensor = tensor.to(dtype=compute_dtype)
                             elif tensor.dtype != target_torch_dtype:
                                 tensor = tensor.to(dtype=target_torch_dtype)
-                            tensor = tensor.to(device=self.target_device)
+                            # Keep source tensors on CPU — merge_triple_method's per-key
+                            # .to(device) at checkpoint_methods.py:878 handles GPU transfer
+                            # on-demand for each key individually.  Previously, ALL batch
+                            # tensors were pre-loaded to GPU here, causing ~9 GB VRAM tied
+                            # up during merge_triple_method, with unrecoverable 2-3 GB
+                            # fragmentation accumulation per batch (→ CUDA OOM by batch 3).
                             batch_sds[idx][norm_key] = tensor
                             batch_mappings[idx][norm_key] = orig_key
                             # batch_original_sds[idx][orig_key] = tensor  # REMOVED — unused in checkpoint path
@@ -782,32 +872,107 @@ class CheckpointTripleStreamWriter:
                     #   (merged_dict: Dict[str, Tensor], corrupted_keys: List[str])
                     # This is NOT the same function as engine/triple_methods.py
                     # which returns 4 values.
-                    merged_dict, batch_corrupted = merge_triple_method(
-                        sds=batch_sds,
-                        weights=weights,
-                        method=config.get('method', 'linear'),
-                        density=config.get('density', 1.0),
-                        uniqueness=config.get('uniqueness', 0.7),
-                        threshold=config.get('threshold', 0.0),
-                        blend=config.get('blend', 0.5),
-                        blend_mode=config.get('blend_mode', 'auto'),
-                        magnitude_scaling=config.get('magnitude_scaling', 'none'),
-                        max_scaling_factor=config.get('max_scaling_factor', 10.0),
-                        batch_size=batch_size,
-                        streaming=config.get('streaming', True),
-                        energy_preservation=config.get('energy_preservation', True),
-                        balancing_mode=config.get('balancing_mode', 'disabled'),
-                        weight_unet=config.get('weight_unet', 1.0),
-                        weight_clip=config.get('weight_clip', 1.0),
-                        weight_vae=config.get('weight_vae', 1.0),
-                        weight_te=config.get('weight_te', 1.0),
-                        mappings=batch_mappings,
-                        original_sds=None,  # was batch_original_sds — only used for LoRA alpha lookup
-                        metas=self.metadatas,
-                        on_substep=on_merge_step,
-                        resolved_device=self.target_device,
-                        resolved_dtype=self.target_dtype,
-                    )
+                    merge_device = self.target_device
+                    _batch_t0 = time.time()
+                    try:
+                        merged_dict, batch_corrupted = merge_triple_method(
+                            sds=batch_sds,
+                            weights=weights,
+                            method=config.get('method', 'linear'),
+                            density=config.get('density', 1.0),
+                            uniqueness=config.get('uniqueness', 0.7),
+                            threshold=config.get('threshold', 0.0),
+                            blend=config.get('blend', 0.5),
+                            blend_mode=config.get('blend_mode', 'auto'),
+                            magnitude_scaling=config.get('magnitude_scaling', 'none'),
+                            max_scaling_factor=config.get('max_scaling_factor', 10.0),
+                            batch_size=batch_size,
+                            streaming=config.get('streaming', True),
+                            energy_preservation=config.get('energy_preservation', True),
+                            balancing_mode=config.get('balancing_mode', 'disabled'),
+                            weight_unet=config.get('weight_unet', 1.0),
+                            weight_clip=config.get('weight_clip', 1.0),
+                            weight_vae=config.get('weight_vae', 1.0),
+                            weight_te=config.get('weight_te', 1.0),
+                            mappings=batch_mappings,
+                            original_sds=None,
+                            metas=self.metadatas,
+                            on_substep=on_merge_step,
+                            resolved_device=merge_device,
+                            resolved_dtype=self.target_dtype,
+                            sequential_only=self._oom_cpu_fallback,
+                        )
+                    except torch.cuda.OutOfMemoryError:
+                        cleanup_memory()
+                        print(f"   ⚠️ CUDA OOM on batch {batch_num} — falling back to CPU for remaining tensors")
+                        # All subsequent batches will use CPU too
+                        self._oom_cpu_fallback = True
+                        merge_device = torch.device("cpu")
+
+                        # ── Rebuild batch_sds from source files ────────────────────────
+                        # The first (GPU) call to merge_triple_method partially consumed
+                        # batch_sds via sd.pop() (an intentional GPU-memory optimization).
+                        # We cannot reuse the partially-consumed dicts — instead, re-read
+                        # all tensors from the original source files directly onto CPU.
+                        print(f"   🔄 Rebuilding batch {batch_num} tensors on CPU from source files...")
+                        batch_sds = [{} for _ in range(len(self.source_paths))]
+                        batch_mappings = [{} for _ in range(len(self.source_paths))]
+                        for item in batch_items:
+                            norm_key = item['norm_key']
+                            orig_keys = item['orig_keys']
+                            source_indices = item['sources']
+                            for idx in source_indices:
+                                orig_key = orig_keys[idx]
+                                tensor = batch_sources[idx][orig_key]
+                                target_torch_dtype = self.DTYPE_MAP[item['dtype']][0]
+
+                                # ── FP8 dequant (same logic as lines 815-837) ──
+                                if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                                    # Dequant FP8 → float32 using companion scale factors
+                                    tensor = dequant_fp8_tensor(tensor, orig_key, torch.float32, batch_sources[idx])
+
+                                # ── Dtype conversion (same logic as lines 839-848) ──
+                                if target_torch_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                                    compute_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+                                    if tensor.dtype != compute_dtype:
+                                        tensor = tensor.to(dtype=compute_dtype)
+                                elif tensor.dtype != target_torch_dtype:
+                                    tensor = tensor.to(dtype=target_torch_dtype)
+
+                                # Always CPU for the retry
+                                tensor = tensor.to(device=torch.device("cpu"))
+                                batch_sds[idx][norm_key] = tensor
+                                batch_mappings[idx][norm_key] = orig_key
+
+                        merged_dict, batch_corrupted = merge_triple_method(
+                            sds=batch_sds,
+                            weights=weights,
+                            method=config.get('method', 'linear'),
+                            density=config.get('density', 1.0),
+                            uniqueness=config.get('uniqueness', 0.7),
+                            threshold=config.get('threshold', 0.0),
+                            blend=config.get('blend', 0.5),
+                            blend_mode=config.get('blend_mode', 'auto'),
+                            magnitude_scaling=config.get('magnitude_scaling', 'none'),
+                            max_scaling_factor=config.get('max_scaling_factor', 10.0),
+                            batch_size=batch_size,
+                            streaming=config.get('streaming', True),
+                            energy_preservation=config.get('energy_preservation', True),
+                            balancing_mode=config.get('balancing_mode', 'disabled'),
+                            weight_unet=config.get('weight_unet', 1.0),
+                            weight_clip=config.get('weight_clip', 1.0),
+                            weight_vae=config.get('weight_vae', 1.0),
+                            weight_te=config.get('weight_te', 1.0),
+                            mappings=batch_mappings,
+                            original_sds=None,
+                            metas=self.metadatas,
+                            on_substep=on_merge_step,
+                            resolved_device=merge_device,
+                            resolved_dtype=self.target_dtype,
+                            sequential_only=True,
+                        )
+                    print(f"   🕐 [t={time.time()-_weave_t0:.1f}s] weave batch {batch_num}/{num_batches}: merged {len(batch_items)} tensors (merge took {time.time()-_batch_t0:.1f}s)")
+
                     if batch_corrupted:
                         if not hasattr(self, 'corrupted_keys'):
                             self.corrupted_keys = []
@@ -837,16 +1002,31 @@ class CheckpointTripleStreamWriter:
                                 else:
                                     raise RuntimeError(f"Missing merged tensor for key {norm_key}")
 
-                            # ── Convert to target dtype on device (GPU accelerated) before CPU transfer ──
-                            target_dtype_str = item['dtype']
-                            target_torch_dtype = self.DTYPE_MAP[target_dtype_str][0]
-                            if merged_tensor.dtype != target_torch_dtype:
-                                merged_tensor = merged_tensor.to(dtype=target_torch_dtype)
-
-                            # Ensure tensor is contiguous and on CPU
+                            # Ensure tensor is contiguous and move to CPU FIRST
+                            # (before dtype conversion, so FP8 quantization runs on CPU
+                            # and doesn't spike GPU memory with F32 intermediates)
                             if not merged_tensor.is_contiguous():
                                 merged_tensor = merged_tensor.contiguous()
                             merged_tensor_cpu = merged_tensor if merged_tensor.device.type == 'cpu' else merged_tensor.cpu()
+
+                            # ── Convert to target dtype with proper FP8 quantization ──
+                            target_dtype_str = item['dtype']
+                            target_torch_dtype = self.DTYPE_MAP[target_dtype_str][0]
+                            if merged_tensor_cpu.dtype != target_torch_dtype:
+                                if target_torch_dtype in (torch.float8_e4m3fn, torch.float8_e5m2) \
+                                   and norm_key.endswith('.weight') and not should_preserve_bf16(norm_key):
+                                    # Proper scale-then-cast for FP8 output weights (on CPU)
+                                    q, wscale, iscale = quantize_weight_to_fp8_with_scales(
+                                        merged_tensor_cpu, target_torch_dtype
+                                    )
+                                    merged_tensor_cpu = q
+                                    # Store companion scales for writing later
+                                    self._companion_scales[norm_key] = (wscale, iscale)
+                                elif target_torch_dtype in (torch.float8_e4m3fn, torch.float8_e5m2) \
+                                     and should_preserve_bf16(norm_key):
+                                    merged_tensor_cpu = merged_tensor_cpu.to(dtype=torch.bfloat16)
+                                else:
+                                    merged_tensor_cpu = merged_tensor_cpu.to(dtype=target_torch_dtype)
 
                             # ── Phase 2: skip tensors for zero-weight components ──
                             if self._omitted_components:
@@ -891,16 +1071,31 @@ class CheckpointTripleStreamWriter:
                                     print(f"   [DIAG] ⚠️ batch_items count={len(batch_items)}, batch_sds[0] keys={len(batch_sds[0])}")
                                     raise RuntimeError(f"Missing merged tensor for key {norm_key}")
 
-                            # ── Convert to target dtype on device (GPU accelerated) before CPU transfer ──
-                            target_dtype_str = item['dtype']
-                            target_torch_dtype = self.DTYPE_MAP[target_dtype_str][0]
-                            if merged_tensor.dtype != target_torch_dtype:
-                                merged_tensor = merged_tensor.to(dtype=target_torch_dtype)
-
-                            # Ensure tensor is contiguous and on CPU
+                            # Ensure tensor is contiguous and move to CPU FIRST
+                            # (before dtype conversion, so FP8 quantization runs on CPU
+                            # and doesn't spike GPU memory with F32 intermediates)
                             if not merged_tensor.is_contiguous():
                                 merged_tensor = merged_tensor.contiguous()
                             merged_tensor_cpu = merged_tensor if merged_tensor.device.type == 'cpu' else merged_tensor.cpu()
+
+                            # ── Convert to target dtype with proper FP8 quantization ──
+                            target_dtype_str = item['dtype']
+                            target_torch_dtype = self.DTYPE_MAP[target_dtype_str][0]
+                            if merged_tensor_cpu.dtype != target_torch_dtype:
+                                if target_torch_dtype in (torch.float8_e4m3fn, torch.float8_e5m2) \
+                                   and norm_key.endswith('.weight') and not should_preserve_bf16(norm_key):
+                                    # Proper scale-then-cast for FP8 output weights (on CPU)
+                                    q, wscale, iscale = quantize_weight_to_fp8_with_scales(
+                                        merged_tensor_cpu, target_torch_dtype
+                                    )
+                                    merged_tensor_cpu = q
+                                    # Store companion scales for writing later
+                                    self._companion_scales[norm_key] = (wscale, iscale)
+                                elif target_torch_dtype in (torch.float8_e4m3fn, torch.float8_e5m2) \
+                                     and should_preserve_bf16(norm_key):
+                                    merged_tensor_cpu = merged_tensor_cpu.to(dtype=torch.bfloat16)
+                                else:
+                                    merged_tensor_cpu = merged_tensor_cpu.to(dtype=target_torch_dtype)
 
                             # Verify tensor size matches survey expectation
                             expected_size = item['size']  # bytes from survey
@@ -973,7 +1168,9 @@ class CheckpointTripleStreamWriter:
                     if _avail is not None:
                         print(f"      📊 RAM: {_avail / (1024**3):.2f} GB available")
 
-                    # Explicitly free GPU tensors before next batch
+                    # Clean up batch references — GPU tensors no longer accumulate
+                    # at batch level (tensors stay on CPU; per-key GPU transfer is
+                    # handled by merge_triple_method inside checkpoint_methods.py).
                     del batch_sds
                     del batch_mappings
                     del merged_dict
@@ -987,7 +1184,44 @@ class CheckpointTripleStreamWriter:
                     for bs in batch_sources:
                         bs.close()
 
+            # ── Write companion scale tensors (after all weight batches) ──
+            # Companion scales are scalar FP32 tensors generated during FP8 quantization
+            # of parent weight tensors. They were partitioned into self.companion_list
+            # during survey() and are now written here from self._companion_scales.
+            if self.companion_list:
+                if self.use_dict:
+                    for item in self.companion_list:
+                        norm_key = item['norm_key']
+                        parent_norm_key = item.get('_parent_norm_key')
+                        if parent_norm_key and parent_norm_key in self._companion_scales:
+                            scale_idx = 0 if item.get('_scale_type') == 'weight_scale' else 1
+                            tensor = self._companion_scales[parent_norm_key][scale_idx]
+                            self._output_dict[norm_key] = tensor
+                else:
+                    print(f"   [WEAVE] Writing {len(self.companion_list)} companion scale tensors...")
+                    for item in self.companion_list:
+                        norm_key = item['norm_key']
+                        parent_norm_key = item.get('_parent_norm_key')
+                        if parent_norm_key and parent_norm_key in self._companion_scales:
+                            scale_idx = 0 if item.get('_scale_type') == 'weight_scale' else 1
+                            tensor = self._companion_scales[parent_norm_key][scale_idx]
+                        else:
+                            raise RuntimeError(
+                                f"Missing companion scale for '{norm_key}' "
+                                f"(parent='{parent_norm_key}')"
+                            )
+
+                        # Tensor is already F32 CPU scalar — just write it as raw bytes
+                        expected_size = item['size']
+                        raw_bytes = self._tensor_to_bytes(tensor)
+                        current_pos = out_f.tell()
+                        start = current_pos - data_start
+                        out_f.write(raw_bytes)
+                        end = out_f.tell() - data_start
+                        self.actual_offsets[norm_key] = (start, end)
+
             # No internal tracker to clean up — on_substep handles all advancement.
+            print(f"   🕐 [t={time.time()-_weave_t0:.1f}s] weave: all {num_batches} batches complete")
             
             # Post-loop final GC sweep
             cleanup_memory()
@@ -1066,6 +1300,30 @@ class CheckpointTripleStreamWriter:
                         }
                         added_keys.add(key)
                 
+                # ── Add companion scale tensors to final header ──
+                for item in self.companion_list:
+                    norm_key = item['norm_key']
+                    key = item['key']
+                    entry = self.actual_offsets.get(norm_key)
+                    if entry is not None:
+                        start, end = entry
+                    else:
+                        # Fallback: compute from cumulative position
+                        start = cumulative_offset
+                        end = cumulative_offset + item['size']
+                        fallback_count += 1
+                        if fallback_count <= 10:
+                            print(f"   [WARNING] Offset for companion '{norm_key}' not in actual_offsets. "
+                                  f"Using cumulative: ({start}, {end})")
+                    cumulative_offset = end
+                    if key not in added_keys:
+                        final_header[key] = {
+                            "dtype": item['dtype'],
+                            "shape": list(item['shape']),
+                            "data_offsets": [start, end]
+                        }
+                        added_keys.add(key)
+                
                 if fallback_count:
                     print(f"   [FALLBACK] {fallback_count} tensor(s) used cumulative fallback offset "
                           f"(missing from actual_offsets, likely batches 1-{max(1, fallback_count // 64)})")
@@ -1105,12 +1363,10 @@ class CheckpointTripleStreamWriter:
                     print(f"[WARNING] File position after final header ({out_f.tell()}) does not match data_start ({self.data_start}), seeking")
                     out_f.seek(self.data_start)
                 out_f.flush()
-                if not self.use_buffer:
-                    os.fsync(out_f.fileno())
+                os.fsync(out_f.fileno())
                 
-                # Validate only for disk mode (buffer validation = successful parse by caller)
-                if not self.use_buffer:
-                    self._validate_safetensors_file(self.output_path)
+                # Validate the safetensors file after writing
+                self._validate_safetensors_file(self.output_path)
             
         
         finally:
@@ -1120,14 +1376,10 @@ class CheckpointTripleStreamWriter:
                 if hasattr(self, '_omitted_components') and self._omitted_components:
                     omit_msg = f" (omitted {self._omitted_components} zero-weight components)"
                 print(f"🧠 Direct dict mode completed — {len(self._output_dict)} tensors stored in output dict{omit_msg}")
-            elif self.use_buffer:
-                # Rewind buffer for reading; store for later retrieval
-                out_f.seek(0)
-                self._output_buffer = out_f
-                print(f"🧠 Triple checkpoint merge completed in RAM buffer ({len(self._output_buffer.getvalue())} bytes)")
             else:
                 out_f.close()
                 print(f"✅ Triple checkpoint merging completed: {self.output_path}")
+            print(f"   🕐 [t={time.time()-_weave_t0:.1f}s] weave: output finalized")
     
     def _validate_safetensors_file(self, filepath):
         """

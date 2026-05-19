@@ -27,6 +27,9 @@ full control when you need precision.**
 | 🛡️ | **Easy Checkpoint Studio** | Precision surgery for full checkpoints — precision casting FP8/BF16/FP32, component stripping VAE/TE/CLIP, SVD compression, and structural remapping. |
 | 🎨 | **Easy Checkpoint Merger** | Merge 2–3 full model checkpoints with Weight Block Map component‑wise scaling. Streaming engine for low RAM usage. |
 | 🔬 | **Easy LoRA Extractor** | Extract a LoRA from the delta between a base and fine‑tuned checkpoint. SVD decomposition with auto‑energy rank selection. |
+| 🔧 | **Easy Component Extractor** | Split a checkpoint into its building blocks — extract UNet, CLIP, or VAE as separate files with precision control. |
+| 🧩 | **Easy Component Combiner** | Reassemble extracted UNet + CLIP + VAE components back into a single full checkpoint. |
+| 🧩 | **Easy Component Merger** | Merge 2–3 component state dicts (e.g., two different CLIP sets or UNets) using the full merge method suite. |
 | 🔥 | **Easy LoRA Baker** | Bake a LoRA (or merged LoRA) directly into a full checkpoint at the tensor level. Produces MODEL+CLIP+VAE with RAM Guard fallback. |
 
 ---
@@ -90,6 +93,54 @@ Console output keeps you informed at every step without overwhelming.
 - **Explore:** Drag [`assets/nodes.png`](assets/nodes.png) into the workflow area to see the suite in action.
 - **Experiment:** Connect a *Easy LoRA Merger* → *Easy LoRA Baker* pipeline, or use *Easy Checkpoint Studio* to shrink a 12GB checkpoint to FP8.
 - **Feedback:** Open an issue on GitHub — contributions and ideas welcome.
+
+---
+
+# ⚙️ Precision Options
+
+Different nodes expose different precision tiers depending on their capabilities:
+
+### Standard Tier — all float formats
+Used by: **Easy LoRA Merger**, **Easy LoRA Studio**
+
+| Option | Behavior |
+|--------|----------|
+| `auto` | Auto-select — defaults to BF16 on supported GPUs |
+| `float32` | Full precision, 4 bytes/param — maximum quality |
+| `bfloat16` | Half precision, 2 bytes/param — good balance |
+| `float16` | Half precision, 2 bytes/param — good balance |
+
+### Extended Tier — adds FP8 support
+Used by: **Easy Checkpoint Merger**, **Easy Component Extractor**, **Easy Component Combiner**, **Easy Component Merger**, **Easy LoRA Baker**
+
+| Option | Behavior |
+|--------|----------|
+| *(all Standard options above)* | |
+| `fp8_e4m3fn` | FP8 quantization, 1 byte/param — memory efficient |
+| `fp8_e5m2` | FP8 quantization (wider range) — memory efficient |
+
+### Studio Tier — full conversion toolkit
+Used by: **Easy Checkpoint Studio**
+
+| Option | Behavior |
+|--------|----------|
+| *(all Extended options above)* | |
+| `int8` | Explicit INT8 quantization, 1 byte/param |
+| `int8_convrot` | INT8 with convolution rotation handling |
+| `svd_only` | SVD compression only, no dtype conversion |
+
+> 💡 **Tip:** For everyday use, just leave it on `auto`. The nodes will pick the best format for your hardware automatically.
+
+---
+
+# 📐 Design Philosophy
+
+The suite is engineered for stability and SSD-friendly operation:
+
+- **No unnecessary disk writes** — intermediate data stays in RAM. Temp files are created only when RAM Guard activates or `save_trigger=True`.
+- **Clean resource management** — file handles from checkpoint loading are closed immediately after model objects are constructed, preventing stale handles from causing I/O during garbage collection.
+- **Predictable performance** — no background cleanup threads. All file I/O is explicit and happens at known points in the pipeline.
+- **Memory-efficient streaming** — large checkpoints are processed in configurable batch sizes, keeping peak RAM usage under control.
 
 ---
 

@@ -1,0 +1,41 @@
+# ── Python ──────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Virtual environments ────────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── IDE / Editor ────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ── OS ──────────────────────────────────────────────────────────
+Thumbs.db
+.DS_Store
+
+# ── ComfyUI (these files belong in ComfyUI root, not in custom_nodes) ──
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.gguf
+*.onnx
+
+# ── Project-specific: large local test data ─────────────────────
+flux-test/
+anima/
+
+# ── Archive (development artifacts, not for release) ────────────
+_archive/

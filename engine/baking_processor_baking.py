@@ -8,16 +8,31 @@ Extracted from baking_processor.py. Contains:
   - Output assembly, NaN/Inf sanitization, metadata and forensic reporting
 """
 
+import json
+import math
 from collections import OrderedDict
+from pathlib import Path
 import torch
 import time
+_T0 = time.time()
 from typing import Dict, List, Optional, Tuple, Set, Any
+
+# FP8 quantizer — scale-then-cast, BF16 preservation, companion scales
+from .fp8_quantizer import (
+    quantize_to_fp8,
+    compute_weight_scale,
+    should_preserve_bf16,
+    quantize_weight_to_fp8_with_scales,
+    quantize_weight_to_fp8_with_scales_optimized,
+)
 
 from ..utils import (
     categorize_checkpoint_key,
     ProgressTracker,
     comfyui_yield,
     memory_guard,
+    cleanup_memory,
+    get_available_ram,
 )
 from .forensics import build_forensic_report, _build_component_breakdown
 from ..engine.metadata_factory import finalize_metadata
@@ -280,8 +295,13 @@ def _safe_bake_add(
     for overflow safety, then clamps to float16 range before downcasting to
     the base tensor's original dtype.
 
+    NOTE: FP8 base tensors are dequantized to bf16 upstream by the lazy
+    mapping (see baker_node.py:286-288), so base.dtype is always bf16 or
+    another non-FP8 dtype when this function is called.  The old FP8 base
+    dequant branch has been removed as dead code.
+
     Args:
-        base: Checkpoint weight tensor (any dtype).
+        base: Checkpoint weight tensor (any dtype, never fp8 at this point).
         delta: Aligned delta tensor (any dtype).
         scale: Combined strength × component_weight factor.
         compute_dtype: Torch dtype to use for computation. Defaults to float32.
@@ -289,12 +309,13 @@ def _safe_bake_add(
                        or float32 as supported by the hardware.
 
     Returns:
-        Result tensor in base's original dtype, NaN/Inf-sanitized and clamped.
+        Result in base's dtype.  Always NaN/Inf-sanitized and clamped.
     """
     # Cast to compute dtype; if fp8, use float16 as compute (most GPUs don't
     # support native fp8 arithmetic on tensors)
     if compute_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         compute_dtype = torch.float16
+
     result = base.to(dtype=compute_dtype) + delta.to(dtype=compute_dtype) * scale
     result = torch.nan_to_num(result, nan=0.0, posinf=65504.0, neginf=-65504.0)
     result = torch.clamp(result, -65504.0, 65504.0)
@@ -338,9 +359,9 @@ def _prepare_bake_key(
     )
     if comp_weight == 0.0:
         return (None, None, None, "component_weight_zero")
+    # Move delta to GPU on-demand (no longer done upfront for all 112 at once — Fix #1)
+    delta = delta.to(device=self.device)
     base = ckpt_sd[ckpt_key].to(device=self.device)
-    # delta is already on device — moved at baking_processor.py:344-346
-    # NOTE: delta.device may be 'cuda:0' while self.device is 'cuda' (string without index).
     # The original delta.to(device=self.device) was a no-op in practice since PyTorch's
     # .to() handles the index normalization. We keep the comment as documentation but
     # remove the assertion — comparing device types between str and torch.device with
@@ -358,6 +379,36 @@ def _prepare_bake_key(
 
 
 # ===================================================================
+# Delta Statistics Accumulation Helper
+# ===================================================================
+
+def _accumulate_delta_stats(
+    base: torch.Tensor,
+    delta_adjusted: torch.Tensor,
+    delta_norms: List[float],
+    base_norms: List[float],
+    delta_ratios: List[float],
+) -> None:
+    """Accumulate delta/base norms and ratio during bake loop.
+
+    Call right after computing result, while base and delta_adjusted are
+    still in GPU registers. Accumulates into caller-provided lists (mutated
+    in-place).  Eliminates the need for a post-bake stats loop that re-reads
+    all base tensors from disk (Fix #2).
+
+    NOTE: Only accumulates finite values — NaN/Inf are silently skipped.
+    """
+    dn = torch.norm(delta_adjusted.float()).item()
+    bn = torch.norm(base.float()).item()
+    if math.isfinite(dn) and math.isfinite(bn):
+        delta_norms.append(dn)
+        base_norms.append(bn)
+        delta_ratios.append(dn / max(bn, 1e-12))
+    
+    
+
+
+# ===================================================================
 # Three Baking Methods
 # ===================================================================
 
@@ -365,13 +416,14 @@ def bake_linear(
     self,
     ckpt_sd: Dict[str, torch.Tensor],
     matched_deltas: Dict[str, torch.Tensor],
+    output_dict: Dict[str, torch.Tensor],
     strength: float = 1.0,
     weight_unet: float = 1.0,
     weight_te: float = 1.0,
     weight_clip: float = 1.0,
     weight_vae: float = 1.0,
     batch_size: int = 64,
-) -> Dict[str, torch.Tensor]:
+) -> Tuple[List[float], List[float]]:
     """
     Standard linear baking: ckpt[key] += delta[key] × strength × component_weight.
 
@@ -379,28 +431,31 @@ def bake_linear(
     Use weight_te=0.0 to skip Text Encoder keys.
     Computes in float32 with float16 range clamp to prevent overflow.
 
-    NOTE: This function receives `self` for access to self.device, self._verbose,
-    self._bake_dropped.
+    Writes directly to `output_dict` (Fix #3) and accumulates delta statistics
+    during the bake loop (Fix #2), eliminating the post-bake stats loop.
+
+    Returns:
+        (delta_norms, delta_ratios) — lists of per-key norm values for forensic reporting.
     """
     print(f"   🧪 Baking method: Linear (strength={strength})")
     print(f"   🧱 Weight Block Map — UNet:{weight_unet} TE:{weight_te} CLIP:{weight_clip} VAE:{weight_vae}")
-    baked: Dict[str, torch.Tensor] = {}
     if not hasattr(self, '_bake_dropped'):
         self._bake_dropped = {}
 
-    key_list = list(matched_deltas.items())
-    total = len(key_list)
+    keys = list(matched_deltas.keys())  # strings only — no tensor refs (Fix #7)
+    total = len(keys)
+    delta_norms: List[float] = []
+    delta_ratios: List[float] = []
+    base_norms: List[float] = []
+    num_batches = (total + batch_size - 1) // batch_size
     with ProgressTracker(total=total, desc="Baking (linear)") as bake_progress:
         for batch_start in range(0, total, batch_size):
-            memory_guard()
             batch_end = min(batch_start + batch_size, total)
-            batch_items = key_list[batch_start:batch_end]
+            batch_keys = keys[batch_start:batch_end]
+            batch_num = batch_start // batch_size + 1
 
-            # ⚡ Pre-fetch all base tensors for this batch — fewer CUDA round-trips
-            for ckpt_key, _ in batch_items:
-                _ = ckpt_sd[ckpt_key].to(device=self.device)
-
-            for ckpt_key, delta in batch_items:
+            for ckpt_key in batch_keys:
+                delta = matched_deltas.pop(ckpt_key)  # pop — refcount drops to zero after del
                 base, delta_adjusted, comp_weight, skip_reason = _prepare_bake_key(
                     self, ckpt_key, delta, ckpt_sd,
                     weight_unet, weight_te, weight_clip, weight_vae,
@@ -409,20 +464,34 @@ def bake_linear(
                     self._bake_dropped[ckpt_key] = skip_reason
                     if getattr(self, '_verbose', False) and skip_reason.startswith("shape_mismatch"):
                         print(f"      ⚠️ Skipping {ckpt_key}: {skip_reason}")
+                    del delta
                     bake_progress += 1
                     continue
 
-                baked[ckpt_key] = _safe_bake_add(base, delta_adjusted, strength * comp_weight,
-                                                  compute_dtype=self.dtype)
+                result = _safe_bake_add(base, delta_adjusted, strength * comp_weight,
+                                         compute_dtype=self.dtype)
+                result_cpu = result.cpu()
+                output_dict[ckpt_key] = result_cpu  # Write directly to output dict (Fix #3)
+                # Accumulate delta statistics during bake (Fix #2)
+                _accumulate_delta_stats(base, delta_adjusted, delta_norms, base_norms, delta_ratios)
+                # Explicitly free CUDA intermediates and consumed delta immediately
+                del base, delta_adjusted, result, delta
                 bake_progress += 1
+            # ── Per-batch RAM profile (peak usage, before cleanup — matches weaver pattern) ──
+            _avail = get_available_ram()
+            if _avail is not None:
+                print(f"      📊 RAM: {_avail / (1024**3):.2f} GB available  [Batch {batch_num}/{num_batches}]")
+            # Batch-level cleanup: release GPU tensors before next batch
+            cleanup_memory()
             comfyui_yield()
-    return baked
+    return (delta_norms, delta_ratios)
 
 
 def bake_impact_weighted(
     self,
     ckpt_sd: Dict[str, torch.Tensor],
     matched_deltas: Dict[str, torch.Tensor],
+    output_dict: Dict[str, torch.Tensor],
     strength: float = 1.0,
     energy_concentration: float = 0.80,
     weight_unet: float = 1.0,
@@ -430,7 +499,7 @@ def bake_impact_weighted(
     weight_clip: float = 1.0,
     weight_vae: float = 1.0,
     batch_size: int = 64,
-) -> Dict[str, torch.Tensor]:
+) -> Tuple[List[float], List[float]]:
     """
     Impact-Weighted baking: only bake into layers carrying most LoRA energy.
 
@@ -441,7 +510,11 @@ def bake_impact_weighted(
     strength × 0.25 or are skipped.
     Computes in float32 with float16 range clamp to prevent overflow.
 
-    NOTE: This function receives `self` for access to self.device, self._verbose.
+    Writes directly to `output_dict` (Fix #3) and accumulates delta statistics
+    during the bake loop (Fix #2), eliminating the post-bake stats loop.
+
+    Returns:
+        (delta_norms, delta_ratios) — lists of per-key norm values for forensic reporting.
     """
     print(f"   🧪 Baking method: Impact-Weighted (energy_concentration={energy_concentration})")
     print(f"   🧱 Weight Block Map — UNet:{weight_unet} TE:{weight_te} CLIP:{weight_clip} VAE:{weight_vae}")
@@ -454,13 +527,8 @@ def bake_impact_weighted(
     total_keys = len(key_list)
     with ProgressTracker(total=total_keys, desc="Analyzing impact energy") as energy_progress:
         for batch_start in range(0, total_keys, batch_size):
-            memory_guard()
             batch_end = min(batch_start + batch_size, total_keys)
             batch_items = key_list[batch_start:batch_end]
-
-            # ⚡ Pre-fetch all base tensors for this batch
-            for ckpt_key, _ in batch_items:
-                _ = ckpt_sd[ckpt_key].to(device=self.device)
 
             for ckpt_key, delta in batch_items:
                 base, delta_adjusted, comp_weight, skip_reason = _prepare_bake_key(
@@ -476,11 +544,14 @@ def bake_impact_weighted(
                 energy = delta_adjusted.pow(2).mean().item()
                 key_data.append((ckpt_key, base, delta_adjusted, energy))
                 energy_progress += 1
+            # Batch-level cleanup: release GPU tensors before next batch
+            del batch_items
+            cleanup_memory()
             comfyui_yield()
 
     if not key_data:
         print("   ⚠️  No valid keys for impact-weighted baking")
-        return {}
+        return ([], [])
 
     # Sort by energy descending
     key_data.sort(key=lambda x: x[3], reverse=True)
@@ -488,9 +559,17 @@ def bake_impact_weighted(
     if total_energy <= 0:
         print("   ⚠️  Zero total energy — falling back to linear bake")
         return bake_linear(
-            self, ckpt_sd, matched_deltas, strength,
+            self, ckpt_sd, matched_deltas, output_dict, strength,
             weight_unet, weight_te, weight_clip, weight_vae,
+            batch_size=batch_size,
         )
+
+    # ── Free original delta tensors — no longer needed (Fix #7) ──
+    # key_data already caches aligned (base, delta_adjusted) tensors, so the
+    # original deltas in matched_deltas and their key_list wrappers are redundant.
+    del key_list
+    matched_deltas.clear()
+    cleanup_memory()
 
     # Find primary driver set
     cumulative = 0.0
@@ -504,42 +583,66 @@ def bake_impact_weighted(
     reduced_strength = strength * 0.25
     print(f"   📊 Primary drivers: {len(primary_keys)}/{len(key_data)} keys ({cumulative/total_energy:.1%} energy)")
 
+    # 🔥 Move cached base+delta tensors to CPU to free VRAM before bake loop.
+    # During energy analysis, _prepare_bake_key loaded them to CUDA and they've
+    # been held in key_data ever since — potentially gigabytes of VRAM.
+    # They'll be moved back to device on-demand in the bake loop below.
+    key_data = [(k, b.cpu(), d.cpu(), e) for k, b, d, e in key_data]
+    cleanup_memory()
+    comfyui_yield()
+
     # --- Bake loop (reuses cached aligned deltas) ---
-    baked: Dict[str, torch.Tensor] = {}
+    delta_norms: List[float] = []
+    delta_ratios: List[float] = []
+    base_norms: List[float] = []
     total_bake = len(key_data)
+    num_batches = (total_bake + batch_size - 1) // batch_size
     with ProgressTracker(total=total_bake, desc="Baking (impact-weighted)") as bake_progress:
         for batch_start in range(0, total_bake, batch_size):
-            memory_guard()
             batch_end = min(batch_start + batch_size, total_bake)
             batch_items = key_data[batch_start:batch_end]
-
-            # ⚡ Pre-fetch all base tensors for this batch
-            for ckpt_key, _, _, _ in batch_items:
-                _ = ckpt_sd[ckpt_key].to(device=self.device)
+            batch_num = batch_start // batch_size + 1
 
             for ckpt_key, base, delta_adjusted, _ in batch_items:
+                # Move cached CPU tensors back to device for computation
+                base = base.to(device=self.device)
+                delta_adjusted = delta_adjusted.to(device=self.device)
                 comp_weight = _get_component_weight(
                     ckpt_key, weight_unet, weight_te, weight_clip, weight_vae
                 )
                 effective_strength = strength if ckpt_key in primary_keys else reduced_strength
-                baked[ckpt_key] = _safe_bake_add(base, delta_adjusted, effective_strength * comp_weight,
-                                                  compute_dtype=self.dtype)
+                result = _safe_bake_add(base, delta_adjusted, effective_strength * comp_weight,
+                                         compute_dtype=self.dtype)
+                result_cpu = result.cpu()
+                output_dict[ckpt_key] = result_cpu  # Write directly to output dict (Fix #3)
+                # Accumulate delta statistics during bake (Fix #2)
+                _accumulate_delta_stats(base, delta_adjusted, delta_norms, base_norms, delta_ratios)
+                # Explicitly free CUDA intermediates immediately
+                del base, delta_adjusted, result
                 bake_progress += 1
+            # ── Per-batch RAM profile (peak usage, before cleanup — matches weaver pattern) ──
+            _avail = get_available_ram()
+            if _avail is not None:
+                print(f"      📊 RAM: {_avail / (1024**3):.2f} GB available  [Batch {batch_num}/{num_batches}]")
+            # Batch-level cleanup: release GPU tensors before next batch
+            del batch_items
+            cleanup_memory()
             comfyui_yield()
-    return baked
+    return (delta_norms, delta_ratios)
 
 
 def bake_orthogonal(
     self,
     ckpt_sd: Dict[str, torch.Tensor],
     matched_deltas: Dict[str, torch.Tensor],
+    output_dict: Dict[str, torch.Tensor],
     strength: float = 1.0,
     weight_unet: float = 1.0,
     weight_te: float = 1.0,
     weight_clip: float = 1.0,
     weight_vae: float = 1.0,
     batch_size: int = 64,
-) -> Dict[str, torch.Tensor]:
+) -> Tuple[List[float], List[float]]:
     """
     Orthogonal baking: project delta onto orthogonal complement of base weights.
 
@@ -550,25 +653,30 @@ def bake_orthogonal(
     For 4D conv weights: flatten to 2D, project, reshape back.
     Use weight_te=0.0 to skip Text Encoder keys.
     Computes in float32 with float16 range clamp to prevent overflow.
+
+    Writes directly to `output_dict` (Fix #3) and accumulates delta statistics
+    during the bake loop (Fix #2), eliminating the post-bake stats loop.
+
+    Returns:
+        (delta_norms, delta_ratios) — lists of per-key norm values for forensic reporting.
     """
     print(f"   🧪 Baking method: Orthogonal (strength={strength})")
     print(f"   🧱 Weight Block Map — UNet:{weight_unet} TE:{weight_te} CLIP:{weight_clip} VAE:{weight_vae}")
 
-    baked: Dict[str, torch.Tensor] = {}
-    key_list = list(matched_deltas.items())
-    total = len(key_list)
-
+    keys = list(matched_deltas.keys())  # strings only — no tensor refs (Fix #7)
+    total = len(keys)
+    delta_norms: List[float] = []
+    delta_ratios: List[float] = []
+    base_norms: List[float] = []
+    num_batches = (total + batch_size - 1) // batch_size
     with ProgressTracker(total=total, desc="Baking (orthogonal)") as bake_progress:
         for batch_start in range(0, total, batch_size):
-            memory_guard()
             batch_end = min(batch_start + batch_size, total)
-            batch_items = key_list[batch_start:batch_end]
+            batch_keys = keys[batch_start:batch_end]
+            batch_num = batch_start // batch_size + 1
 
-            # ⚡ Pre-fetch all base tensors for this batch — fewer CUDA round-trips
-            for ckpt_key, _ in batch_items:
-                _ = ckpt_sd[ckpt_key].to(device=self.device)
-
-            for ckpt_key, delta in batch_items:
+            for ckpt_key in batch_keys:
+                delta = matched_deltas.pop(ckpt_key)  # pop — refcount drops to zero after del
                 base, delta_adjusted, comp_weight, skip_reason = _prepare_bake_key(
                     self, ckpt_key, delta, ckpt_sd,
                     weight_unet, weight_te, weight_clip, weight_vae,
@@ -576,17 +684,30 @@ def bake_orthogonal(
                 if skip_reason is not None:
                     if skip_reason.startswith("shape_mismatch"):
                         print(f"      ⚠️ Skipping {ckpt_key}: {skip_reason}")
+                    del delta
                     bake_progress += 1
                     continue
 
                 # Orthogonal projection
                 delta_ortho = _orthogonal_projection(base, delta_adjusted)
 
-                baked[ckpt_key] = _safe_bake_add(base, delta_ortho, strength * comp_weight,
-                                                  compute_dtype=self.dtype)
+                result = _safe_bake_add(base, delta_ortho, strength * comp_weight,
+                                         compute_dtype=self.dtype)
+                result_cpu = result.cpu()
+                output_dict[ckpt_key] = result_cpu  # Write directly to output dict (Fix #3)
+                # Accumulate delta statistics during bake (Fix #2)
+                _accumulate_delta_stats(base, delta_adjusted, delta_norms, base_norms, delta_ratios)
+                # Explicitly free CUDA intermediates and consumed delta immediately
+                del base, delta_adjusted, delta_ortho, result, delta
                 bake_progress += 1
+            # ── Per-batch RAM profile (peak usage, before cleanup — matches weaver pattern) ──
+            _avail = get_available_ram()
+            if _avail is not None:
+                print(f"      📊 RAM: {_avail / (1024**3):.2f} GB available  [Batch {batch_num}/{num_batches}]")
+            # Batch-level cleanup: release GPU tensors before next batch
+            cleanup_memory()
             comfyui_yield()
-    return baked
+    return (delta_norms, delta_ratios)
 
 
 # ===================================================================
@@ -596,6 +717,8 @@ def bake_orthogonal(
 def _assemble_output(
     original_ckpt_sd: Dict[str, torch.Tensor],
     baked_keys: Dict[str, torch.Tensor],
+    fp8_dequantized: bool = False,
+    target_dtype: Optional[torch.dtype] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Assemble final state dict with VAE pass-through.
@@ -603,17 +726,179 @@ def _assemble_output(
     CRITICAL: Start with a full copy of the original checkpoint state dict.
     Only overwrite keys that were actually baked.
     All unrecognized keys (VAE, CLIP, embeddings, etc.) pass through unchanged.
+
+    Args:
+        fp8_dequantized: When True, the checkpoint had FP8 native weights that
+            were dequantized to bfloat16 for baking.  In this case, cast to the
+            user's target_dtype rather than the original checkpoint dtype (which
+            is FP8 and would re-quantize the delta to zero).
+        target_dtype: User's chosen output precision (e.g., bfloat16, float16).
+            Used only when fp8_dequantized=True.  If None, keep the baked tensor's
+            dtype (which is already bfloat16 from Fix 1 in _safe_bake_add).
     """
     output_sd = dict(original_ckpt_sd)
+    # 🔥 FP8: Strip stale artifact keys when checkpoint was dequantized
+    if fp8_dequantized:
+        stale_keys = [k for k in output_sd
+                      if k.endswith(('.weight_scale', '.input_scale', '.comfy_quant'))]
+        for k in stale_keys:
+            del output_sd[k]
+        if stale_keys:
+            print(f"   🧹 Removed {len(stale_keys)} stale FP8 artifact keys from output")
     for key, tensor in baked_keys.items():
         if key in output_sd:
-            output_sd[key] = tensor.to(
-                device=output_sd[key].device,
-                dtype=output_sd[key].dtype,
-            )
+            if fp8_dequantized:
+                # FP8 checkpoint was dequantized — cast to user's target dtype
+                # or keep as-is (bfloat16 from Fix 1) if no target specified.
+                if target_dtype is not None:
+                    output_sd[key] = tensor.to(
+                        device=output_sd[key].device,
+                        dtype=target_dtype,
+                    )
+                else:
+                    output_sd[key] = tensor.to(device=output_sd[key].device)
+            else:
+                # Normal path: match the original checkpoint's dtype
+                output_sd[key] = tensor.to(
+                    device=output_sd[key].device,
+                    dtype=output_sd[key].dtype,
+                )
     preserved = len(output_sd) - len(baked_keys)
     print(f"   📦 Assembled output: {len(baked_keys)} baked + {preserved} preserved (VAE/etc.)")
     return output_sd
+
+
+def _assemble_output_lazy(
+    ckpt_path: Path,
+    ckpt_header: Dict[str, Any],
+    baked_keys: Dict[str, torch.Tensor],
+    detected_fp8: bool = False,
+    user_fp8_dtype: Optional[torch.dtype] = None,
+) -> Any:  # Returns _LazyCheckpointMapping (dict-like)
+    """
+    Assemble output as a lazy mapping with baked key overlay.
+
+    Instead of copying all non-baked tensors into a dict (17 GiB for Klein 9B),
+    create a lazy mapping that loads non-baked tensors on demand from the
+    original checkpoint file via mmap.
+
+    Baked tensors are stored in the write cache (already in RAM).
+    Compatible with all downstream usage (save_safetensors_stream,
+    load_state_dict_as_model_objects).
+
+    When *user_fp8_dtype* is set (torch.float8_e4m3fn or torch.float8_e5m2),
+    the output is built in FP8 mode:
+      - FP8 source: preserved keys stay FP8 from file (no FP8→BF16→FP8 round trip),
+        companion scales pass through. Only stale .comfy_quant keys are stripped.
+      - BF16/FP16 source: preserved keys stay at original file dtype. The
+        post-assembly FP8 conversion block (in baking_processor.py) converts them.
+      - Baked keys are quantized via quantize_weight_to_fp8_with_scales() with
+        proper companion scale injection (matching Creator-quality algorithm).
+
+    Args:
+        ckpt_path: Path to the original checkpoint .safetensors file.
+        ckpt_header: Full safetensors header dict (tensor names -> shape/dtype/offsets).
+        baked_keys: Dict of {checkpoint_key: baked_tensor} to overlay.
+        detected_fp8: When True, the checkpoint has FP8 native weights.
+        user_fp8_dtype: When set, produce FP8 output using creator-quality
+            scale-then-cast quantization.
+
+    Returns:
+        _LazyCheckpointMapping with baked keys in write cache and all other
+        keys lazy-loaded from the original file.
+    """
+    from .musubi_checkpoint_studio import MusubiCheckpointStudio
+
+    metadata = ckpt_header.get('__metadata__', {})
+    want_fp8_output = user_fp8_dtype is not None
+
+    if want_fp8_output:
+        # ═══════════════════════════════════════════════════════════════
+        # FP8 OUTPUT MODE — handles BOTH FP8 source and BF16/FP16 source
+        # ═══════════════════════════════════════════════════════════════
+
+        # ── Step 1: Create lazy mapping ──
+        if detected_fp8:
+            # FP8 source: preserved keys stay FP8 from file (no dequant).
+            # Companion scales from file header pass through to output
+            # (items() includes them naturally).
+            mapping = MusubiCheckpointStudio._LazyCheckpointMapping(
+                ckpt_path, metadata,
+                target_dtype=None,  # No dequant — preserve FP8 as-is
+            )
+        else:
+            # BF16/FP16 source: preserved keys stay original from file.
+            # Post-assembly block will convert them to FP8 sequentially.
+            mapping = MusubiCheckpointStudio._LazyCheckpointMapping(
+                ckpt_path, metadata,
+                target_dtype=None,
+            )
+
+        # ── Step 2: Quantize baked keys to FP8 ──
+        fp8_converted = 0
+        bf16_preserved = 0
+        for key, tensor in baked_keys.items():
+            if key.endswith('.weight') and not should_preserve_bf16(key):
+                q, wscale, iscale = quantize_weight_to_fp8_with_scales_optimized(
+                    tensor, user_fp8_dtype
+                )
+                mapping[key] = q
+                base_key = key[:-len('.weight')]
+                mapping[base_key + '.weight_scale'] = wscale
+                mapping[base_key + '.input_scale'] = iscale
+                fp8_converted += 1
+            elif should_preserve_bf16(key):
+                mapping[key] = tensor.to(dtype=torch.bfloat16)
+                bf16_preserved += 1
+            else:
+                mapping[key] = tensor.to(dtype=user_fp8_dtype)
+
+        # ── Step 3: Stale FP8 key cleanup ──
+        # Only strip .comfy_quant — weight_scale/input_scale are needed for
+        # FP8 passthrough in the saved output file.
+        if detected_fp8:
+            mapping._ensure_open()
+            stale = [k for k in mapping._header
+                     if k.endswith(('.comfy_quant', '.weight_scale', '.input_scale'))]
+            for k in stale:
+                mapping.pop(k, None)
+            if stale:
+                print(f"   🧹 Removed {len(stale)} stale FP8 artifact keys")
+
+        # Flag so post-assembly code (baking_processor.py) knows FP8 was handled
+        mapping._user_fp8_mode = True
+        # Store the fp8 dtype string for _quantization_metadata building
+        fp8_dtype_str = 'F8_E4M3' if user_fp8_dtype == torch.float8_e4m3fn else 'F8_E5M2'
+        mapping._user_fp8_dtype_str = fp8_dtype_str
+
+        print(f"   🎯 FP8 lazy assembly: {fp8_converted} FP8 quantized + "
+              f"{bf16_preserved} BF16 preserved baked keys")
+
+    else:
+        # ═══════════════════════════════════════════════════════════════
+        # ORIGINAL BEHAVIOR — no FP8 output requested
+        # ═══════════════════════════════════════════════════════════════
+        mapping = MusubiCheckpointStudio._LazyCheckpointMapping(
+            ckpt_path, metadata,
+            target_dtype=torch.bfloat16 if detected_fp8 else None,
+        )
+        for key, tensor in baked_keys.items():
+            mapping[key] = tensor
+
+        # Strip stale FP8 artifact keys (weight_scale, input_scale, comfy_quant)
+        # meaningless after dequantization to bfloat16.
+        if detected_fp8:
+            mapping._ensure_open()
+            stale_keys = [k for k in mapping._header
+                          if k.endswith(('.weight_scale', '.input_scale', '.comfy_quant'))]
+            for k in stale_keys:
+                mapping.pop(k, None)
+            if stale_keys:
+                print(f"   🧹 Removed {len(stale_keys)} stale FP8 artifact keys from output")
+
+    preserved = len(mapping) - len(baked_keys)
+    print(f"   📦 Assembled output (lazy): {len(baked_keys)} baked + {preserved} preserved via mmap")
+    return mapping
 
 
 def _sanitize_or_revert(
@@ -628,8 +913,17 @@ def _sanitize_or_revert(
     tensor contains NaN/Inf, REVERT to the original weight instead of replacing
     NaN with zero. Zero replacements cause black/dark patches in generated
     images because the layer's contribution becomes zero.
+
+    NOTE: FP8 dtypes (float8_e4m3fn, float8_e5m2) don't support torch.isinf()
+    or torch.isnan() — cast to float32 for detection when needed.
     """
-    if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+    # FP8 dtypes lack isinf/isnan kernels — cast to float32 for detection
+    if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        check_tensor = tensor.float()
+    else:
+        check_tensor = tensor
+
+    if torch.isnan(check_tensor).any() or torch.isinf(check_tensor).any():
         if original_tensor is not None:
             print(f"      ⚠️ NaN/Inf detected in {key} — REVERTING TO ORIGINAL")
             return original_tensor.to(dtype=tensor.dtype, device=tensor.device)
@@ -684,8 +978,22 @@ def _build_metadata(
             "preserve_b" — Same as preserve_a (symmetrical at single-source level).
             "merge_basic" — Baking signature has priority over original.
     """
+    # 🔥 FP8: Strip quantization metadata from original checkpoint before
+    # passing to finalize_metadata.  FP8 checkpoints have metadata like
+    # "quantization metadata version 1" that tells ComfyUI to use the slow
+    # mixed precision path.  Since we dequantize to bfloat16, this metadata
+    # is stale and must be removed (safety net — primary stripping happens
+    # in baker_node.py:252 Fix 2).
+    if original_metadata:
+        cleaned_metadata = {
+            k: v for k, v in original_metadata.items()
+            if not any(q in k.lower() for q in ['quantization', 'scale'])
+        }
+    else:
+        cleaned_metadata = None
+
     return finalize_metadata(
-        metadata=original_metadata,
+        metadata=cleaned_metadata,
         mode=metadata_mode,
         component="baker",
         extra_fields={

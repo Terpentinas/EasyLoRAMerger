@@ -12,7 +12,7 @@ Extracted from baking_processor.py. Contains all key matching logic:
 import torch
 import re
 import math
-from typing import Callable, Dict, List, Optional, Tuple, Set
+from typing import Any, Callable, Dict, List, Optional, Tuple, Set
 
 from ..utils import ProgressTracker
 from .baking_processor_constants import (
@@ -20,6 +20,7 @@ from .baking_processor_constants import (
     LORA_TO_CHECKPOINT_PREFIXES,
 )
 from .baking_processor_baking import _check_shape_compatible
+from .baking_processor_delta import _LazyDeltaDict, _MatchedDeltas, _ShapeInfo
 
 
 def _strip_tensor_suffix(key: str) -> str:
@@ -533,12 +534,90 @@ def _build_reverse_key_map(ckpt_sd: Dict[str, torch.Tensor]) -> Dict[str, str]:
         reverse_map[base_key] = base_key
 
     # ================================================================
+    # Section 4c: Flux transformer entries (transformer.double_blocks.*, transformer.single_blocks.*)
+    # Flux checkpoints use bare transformer.* keys without model.diffusion_model prefix.
+    # These need to be registered so LoRA keys (which may have diffusion_model. prefix
+    # after normalization) can find their checkpoint counterparts.
+    # ================================================================
+    for base_key in ckpt_bases:
+        if not base_key.startswith('transformer.'):
+            continue
+        
+        # Register bare key (for LoRAs that use raw Flux key naming)
+        reverse_map[base_key] = base_key
+        
+        # Register with model.diffusion_model prefix (for LoRAs normalized to ComfyUI format)
+        reverse_map[f"model.diffusion_model.{base_key}"] = base_key
+        
+        # Register with diffusion_model prefix (shorthand variant)
+        reverse_map[f"diffusion_model.{base_key}"] = base_key
+        
+        # Also register 'lora_unet_' prefix variant for ComfyUI-style LoRA keys
+        pure_path = base_key[len('transformer.'):]  # double_blocks.0.img_attn.qkv
+        reverse_map[f"lora_unet_{pure_path}"] = base_key
+
+    # ================================================================
+    # Section 4d: Flux keys with diffusion_model.{pure_path} prefix (Klein normalized format)
+    # After identity_normalize() → normalize_all_klein_formats(), Flux Klein LoRA
+    # keys use diffusion_model.double_blocks.* / diffusion_model.single_blocks.*
+    # format (without transformer. sub-path). Map these to the checkpoint's
+    # transformer.double_blocks.* / transformer.single_blocks.* keys.
+    #
+    # Example:
+    #   LoRA (normalized):  diffusion_model.double_blocks.0.img_attn.qkv
+    #   Checkpoint:         transformer.double_blocks.0.img_attn.qkv
+    #   Reverse map entry:  diffusion_model.double_blocks.0.img_attn.qkv
+    #                       → transformer.double_blocks.0.img_attn.qkv
+    #
+    # NOTE: This only applies to vanilla Flux checkpoints that use the
+    #       transformer. prefix. For Klein checkpoints which use bare
+    #       double_blocks.* / single_blocks.* keys, see Section 4e below.
+    # ================================================================
+    for base_key in ckpt_bases:
+        if not base_key.startswith('transformer.'):
+            continue
+        pure_path = base_key[len('transformer.'):]  # double_blocks.0.img_attn.qkv
+        
+        # Map diffusion_model.{pure_path} (Klein normalized format)
+        reverse_map[f"diffusion_model.{pure_path}"] = base_key
+        
+        # Map model.diffusion_model.{pure_path} (full prefix variant)
+        reverse_map[f"model.diffusion_model.{pure_path}"] = base_key
+
+    # ================================================================
+    # Section 4e: Flux bare double_blocks/single_blocks keys (Klein 4B/9B format)
+    # Klein checkpoints store keys WITHOUT the transformer. prefix, using bare
+    # double_blocks.* / single_blocks.* format. Normalized LoRA keys use
+    # diffusion_model.double_blocks.* / diffusion_model.single_blocks.* which
+    # need to map to these bare checkpoint keys.
+    #
+    # Example:
+    #   LoRA (normalized):  diffusion_model.double_blocks.0.img_attn.qkv
+    #   Checkpoint:         double_blocks.0.img_attn.qkv
+    #   Reverse map entry:  diffusion_model.double_blocks.0.img_attn.qkv
+    #                       → double_blocks.0.img_attn.qkv
+    # ================================================================
+    for base_key in ckpt_bases:
+        if not base_key.startswith(('double_blocks.', 'single_blocks.')):
+            continue
+        
+        # Map diffusion_model.{base_key} (Klein normalized LoRA format)
+        reverse_map[f"diffusion_model.{base_key}"] = base_key
+        
+        # Map model.diffusion_model.{base_key} (full prefix variant)
+        reverse_map[f"model.diffusion_model.{base_key}"] = base_key
+        
+        # Map lora_unet_{base_key} (ComfyUI-style LoRA key format)
+        reverse_map[f"lora_unet_{base_key}"] = base_key
+
+    # ================================================================
     # Section 5: Bare layers (generic fallback for un-prefixed keys)
     # ================================================================
     # Handle keys that don't have any standard prefix
     for base_key in ckpt_bases:
         if base_key.startswith(('model.', 'diffusion_model.', 'cond_stage_model.',
-                                'conditioner.', 'transformer.', 'layers.')):
+                                'conditioner.', 'transformer.', 'layers.',
+                                'double_blocks.', 'single_blocks.')):
             continue
 
         # Bare key: register as-is
@@ -718,6 +797,30 @@ def _build_shape_block_index(
     return index
 
 
+def _build_shape_block_index_from_header(
+    header: Dict[str, Any],
+) -> Dict[Tuple[Tuple[int, ...], str], List[str]]:
+    """
+    Build shape+block index from safetensors header dict (no tensor loading).
+    
+    Reads shapes from the header JSON instead of loading tensor data.
+    Memory: ~50 KB for 425 keys vs 17+ GiB for full tensor load.
+    """
+    index: Dict[Tuple[Tuple[int, ...], str], List[str]] = {}
+    for ckpt_key, info in header.items():
+        if not isinstance(info, dict) or 'shape' not in info:
+            continue
+        shape = tuple(info['shape'])
+        base = _strip_tensor_suffix(ckpt_key)
+        block_id = _extract_block_id(base)
+        if block_id is None:
+            continue
+        block_type = block_id.split('.')[0]
+        key = (shape, block_type)
+        index.setdefault(key, []).append(ckpt_key)
+    return index
+
+
 def _build_shape_index(
     ckpt_sd: Dict[str, torch.Tensor],
 ) -> Dict[Tuple[int, ...], List[str]]:
@@ -725,12 +828,34 @@ def _build_shape_index(
     Build index: shape_tuple -> [full_ckpt_keys].
 
     Used by Strategy 5 (shape match last resort) for O(1) lookup.
+    
+    NOTE: When ckpt_sd is a _LazyCheckpointMapping, this calls .items() which
+    loads ALL tensors. For mmap mode, use _build_shape_index_from_header() instead.
     """
     index: Dict[Tuple[int, ...], List[str]] = {}
     for ckpt_key, tensor in ckpt_sd.items():
         if not isinstance(tensor, torch.Tensor):
             continue
         shape = tuple(tensor.shape)
+        index.setdefault(shape, []).append(ckpt_key)
+    return index
+
+
+def _build_shape_index_from_header(
+    header: Dict[str, Any],
+) -> Dict[Tuple[int, ...], List[str]]:
+    """
+    Build shape index from safetensors header dict (no tensor loading).
+    
+    The header maps key -> {dtype, shape, data_offsets}. This reads shapes
+    directly from the header without loading any tensor data.
+    Memory: ~50 KB for 425 keys vs 17+ GiB for full tensor load.
+    """
+    index: Dict[Tuple[int, ...], List[str]] = {}
+    for ckpt_key, info in header.items():
+        if not isinstance(info, dict) or 'shape' not in info:
+            continue
+        shape = tuple(info['shape'])
         index.setdefault(shape, []).append(ckpt_key)
     return index
 
@@ -890,6 +1015,7 @@ def _find_matching_keys(
     ckpt_sd: Dict[str, torch.Tensor],
     lora_deltas: Dict[str, torch.Tensor],
     return_stats: bool = False,
+    ckpt_header: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Match LoRA delta keys to checkpoint keys using ComfyUI-native reverse
@@ -914,6 +1040,11 @@ def _find_matching_keys(
       5. Shape match (last resort)
 
     NOTE: This function receives `self` for access to self.device, self._verbose, etc.
+
+    When `ckpt_header` is provided, shape/block indices are built from the
+    header JSON (no tensors loaded) instead of from the full state dict.
+    This enables the Survey→Match→Weave pipeline where matching happens
+    after only header reading (~50 KB instead of 17+ GiB for Klein 9B).
     """
     print("   🔗 Matching LoRA keys to checkpoint keys...")
 
@@ -954,10 +1085,17 @@ def _find_matching_keys(
         ckpt_suffix_index.setdefault(suffix_key, []).append(base_lower)
 
     # Build shape+block index for O(1) Strategy 4 lookup
-    shape_block_index = _build_shape_block_index(ckpt_sd)
+    # Use header-based indices when available (no tensor loading needed)
+    if ckpt_header is not None:
+        shape_block_index = _build_shape_block_index_from_header(ckpt_header)
+    else:
+        shape_block_index = _build_shape_block_index(ckpt_sd)
 
     # Build shape index for O(1) Strategy 5 lookup
-    shape_index = _build_shape_index(ckpt_sd)
+    if ckpt_header is not None:
+        shape_index = _build_shape_index_from_header(ckpt_header)
+    else:
+        shape_index = _build_shape_index(ckpt_sd)
 
     # =====================================================================
     # PHASE 2: Build reverse key map (ComfyUI-native, exhaustive)
@@ -965,31 +1103,34 @@ def _find_matching_keys(
     reverse_map = _build_reverse_key_map(ckpt_sd)
 
     # =====================================================================
-    # 🔍 DIAGNOSTIC: Sample key coverage in reverse_map (runs always)
+    # 🔍 DIAGNOSTIC: Comprehensive reverse_map coverage (runs always)
     # =====================================================================
     print(f"   📊 Reverse map entries: {len(reverse_map)}")
 
-    # Sample a few delta keys to check reverse_map coverage
     if lora_deltas:
-        sample_keys = list(lora_deltas.keys())[:5]
-        te_sample_keys = [k for k in lora_deltas if 'text_model.' in k][:3]
-        if te_sample_keys:
-            sample_keys = list(set(sample_keys + te_sample_keys))[:5]
+        # Count ALL keys NOT in reverse_map
+        rmap_misses_total = sum(1 for k in lora_deltas if k not in reverse_map)
+        rmap_hits_total = len(lora_deltas) - rmap_misses_total
+        print(f"   📊 Reverse map coverage: {rmap_hits_total}/{len(lora_deltas)} keys in map ({rmap_misses_total} misses)")
 
-        rmap_misses = 0
-        for k in sample_keys:
-            in_rmap = k in reverse_map
-            if not in_rmap:
-                rmap_misses += 1
-                clean_k = k.rstrip('.')
-                ckpt_candidate = f"cond_stage_model.transformer.{clean_k}" if clean_k.startswith('text_model.') else None
-                msg = f"      ❌ Key NOT in reverse_map: '{k}'"
-                if ckpt_candidate:
-                    msg += f"\n         → candidate: '{ckpt_candidate}' (in ckpt: {ckpt_candidate in ckpt_base_lookup})"
-                print(msg)
+        # Special focus on diffusion_model.* keys (Flux Klein normalized format)
+        diffusion_keys = [k for k in lora_deltas if k.startswith('diffusion_model.')]
+        if diffusion_keys:
+            diffusion_misses = [k for k in diffusion_keys if k not in reverse_map]
+            diffusion_hits = len(diffusion_keys) - len(diffusion_misses)
+            rmap_iter_msg = "❌" if diffusion_misses else "✅"
+            print(f"   {rmap_iter_msg} diffusion_model.* keys: {diffusion_hits}/{len(diffusion_keys)} in reverse_map")
+            if diffusion_misses:
+                print(f"      Sample misses (first 5): {diffusion_misses[:5]}")
+                print(f"      ⚠️  {len(diffusion_misses)} diffusion_model.* keys will use fallback strategies")
 
-        if rmap_misses == 0:
-            print(f"   ✅ All sampled keys ({len(sample_keys)}) in reverse_map")
+        # Show first 5 misses for any key type
+        all_misses = [k for k in lora_deltas if k not in reverse_map]
+        if all_misses:
+            for k in all_misses[:5]:
+                print(f"      ❌ Not in reverse_map: '{k}'")
+        else:
+            print(f"   ✅ All {len(lora_deltas)} LoRA keys in reverse_map")
 
     # =====================================================================
     # 🔍 DIAGNOSTIC: Comprehensive key format trace (verbose-only)
@@ -1086,6 +1227,14 @@ def _find_matching_keys(
         else:
             print(f"   🔍 [DIAG] No UNet-style keys in lora deltas (total deltas: {len(lora_deltas)})")
     matched_ckpt_keys: Set[str] = set()
+    # Track ckpt_key → lora_base for _LazyDeltaDict consumers.
+    # When lora_deltas is a lazy dict, `matched` stores _ShapeInfo values
+    # (not tensors), so the bake loop needs a reverse mapping to reconstruct
+    # deltas on demand from the stored A/B components.
+    _ckpt_to_lora: Dict[str, str] = {}
+    # Pre-computed tensors (fused QKV, to_out.0 fallback) that cannot be
+    # reconstructed from _LazyDeltaDict components alone.
+    _precomputed: Dict[str, torch.Tensor] = {}
 
     # =====================================================================
     # FUSED QKV DETECTION
@@ -1102,7 +1251,11 @@ def _find_matching_keys(
     if has_fused_qkv:
         for lora_base in list(lora_deltas.keys()):
             if _head_re.match(lora_base):
-                fused_qkv_heads[lora_base] = lora_deltas.pop(lora_base)
+                if isinstance(lora_deltas, _LazyDeltaDict):
+                    # pop from _LazyDeltaDict reconstructs the delta
+                    fused_qkv_heads[lora_base] = lora_deltas.pop(lora_base)
+                else:
+                    fused_qkv_heads[lora_base] = lora_deltas.pop(lora_base)
 
     total_lora_keys = len(lora_deltas) + len(fused_qkv_heads)
 
@@ -1145,7 +1298,7 @@ def _find_matching_keys(
             return _check_shape_compatible(delta_tensor, ckpt_t)
 
         for lora_base, delta in lora_deltas.items():
-            if not isinstance(delta, torch.Tensor):
+            if not isinstance(delta, (torch.Tensor, _ShapeInfo)):
                 continue
 
             # =============================================================
@@ -1158,6 +1311,8 @@ def _find_matching_keys(
                     if _is_shape_compatible(full_key, delta):
                         matched[full_key] = delta
                         matched_ckpt_keys.add(full_key)
+                        if isinstance(lora_deltas, _LazyDeltaDict):
+                            _ckpt_to_lora[full_key] = lora_base
                         _track_strategy("reverse_map")
                         continue
 
@@ -1169,6 +1324,8 @@ def _find_matching_keys(
                 if _is_shape_compatible(full_key, delta):
                     matched[full_key] = delta
                     matched_ckpt_keys.add(full_key)
+                    if isinstance(lora_deltas, _LazyDeltaDict):
+                        _ckpt_to_lora[full_key] = lora_base
                     _track_strategy("exact")
                     continue
 
@@ -1182,6 +1339,8 @@ def _find_matching_keys(
                     if _is_shape_compatible(full_key, delta):
                         matched[full_key] = delta
                         matched_ckpt_keys.add(full_key)
+                        if isinstance(lora_deltas, _LazyDeltaDict):
+                            _ckpt_to_lora[full_key] = lora_base
                         _track_strategy("prefix")
                         continue
 
@@ -1193,6 +1352,8 @@ def _find_matching_keys(
                 if _is_shape_compatible(fuzzy_match, delta):
                     matched[fuzzy_match] = delta
                     matched_ckpt_keys.add(fuzzy_match)
+                    if isinstance(lora_deltas, _LazyDeltaDict):
+                        _ckpt_to_lora[fuzzy_match] = lora_base
                     _track_strategy("underscore_to_dot")
                     continue
 
@@ -1203,6 +1364,8 @@ def _find_matching_keys(
             if te_cond_match is not None:
                 matched[te_cond_match] = delta
                 matched_ckpt_keys.add(te_cond_match)
+                if isinstance(lora_deltas, _LazyDeltaDict):
+                    _ckpt_to_lora[te_cond_match] = lora_base
                 _track_strategy("te_conditioner")
                 continue
 
@@ -1216,6 +1379,8 @@ def _find_matching_keys(
             if te_direct_match is not None:
                 matched[te_direct_match] = delta
                 matched_ckpt_keys.add(te_direct_match)
+                if isinstance(lora_deltas, _LazyDeltaDict):
+                    _ckpt_to_lora[te_direct_match] = lora_base
                 _track_strategy("deterministic_te")
                 continue
 
@@ -1255,6 +1420,8 @@ def _find_matching_keys(
                     if _is_shape_compatible(full_key, delta):
                         matched[full_key] = delta
                         matched_ckpt_keys.add(full_key)
+                        if isinstance(lora_deltas, _LazyDeltaDict):
+                            _ckpt_to_lora[full_key] = lora_base
                         _track_strategy("normalized_te_direct")
                         if getattr(self, '_verbose', False):
                             print(f"      ✅ Strategy 2.5e (normalized TE direct): "
@@ -1302,6 +1469,8 @@ def _find_matching_keys(
                     if _is_shape_compatible(ckpt_key, delta):
                         matched[ckpt_key] = delta
                         matched_ckpt_keys.add(ckpt_key)
+                        if isinstance(lora_deltas, _LazyDeltaDict):
+                            _ckpt_to_lora[ckpt_key] = lora_base
                         matched_suffix = True
                         break
             if matched_suffix:
@@ -1321,6 +1490,8 @@ def _find_matching_keys(
                             if _is_shape_compatible(ckpt_key, delta):
                                 matched[ckpt_key] = delta
                                 matched_ckpt_keys.add(ckpt_key)
+                                if isinstance(lora_deltas, _LazyDeltaDict):
+                                    _ckpt_to_lora[ckpt_key] = lora_base
                                 matched_suffix = True
                                 break
                     if matched_suffix:
@@ -1334,11 +1505,13 @@ def _find_matching_keys(
             # =============================================================
             shape_block_match = _global_search_by_shape_block(
                 lora_base, delta, ckpt_sd, ckpt_base_lookup, matched_ckpt_keys,
-                shape_block_index,  # NEW: O(1) indexed lookup
+                shape_block_index,
             )
             if shape_block_match is not None:
                 matched[shape_block_match] = delta
                 matched_ckpt_keys.add(shape_block_match)
+                if isinstance(lora_deltas, _LazyDeltaDict):
+                    _ckpt_to_lora[shape_block_match] = lora_base
                 if getattr(self, '_verbose', False):
                     print(f"      🔍 Shape+Block match: {lora_base} → {shape_block_match}")
                 _track_strategy("shape_block")
@@ -1354,6 +1527,8 @@ def _find_matching_keys(
                 if delta.dim() >= 2:
                     matched[ckpt_key] = delta
                     matched_ckpt_keys.add(ckpt_key)
+                    if isinstance(lora_deltas, _LazyDeltaDict):
+                        _ckpt_to_lora[ckpt_key] = lora_base
                     _track_strategy("shape_match")
                     break
             else:
@@ -1416,6 +1591,10 @@ def _find_matching_keys(
 
                         matched[qkv_full_key] = fused_delta
                         matched_ckpt_keys.add(qkv_full_key)
+                        if isinstance(lora_deltas, _LazyDeltaDict):
+                            # QKV fused delta cannot be reconstructed from
+                            # a single _LazyDeltaDict entry — store precomputed.
+                            _precomputed[qkv_full_key] = fused_delta
                         fused_qkv_resolved += 3
                         if getattr(self, '_verbose', False):
                             print(f"      🔄 Fused QKV: layers.{layer_num}.attention "
@@ -1456,6 +1635,9 @@ def _find_matching_keys(
                     delta = lora_deltas[lora_base]
                     matched[out_full_key] = delta
                     matched_ckpt_keys.add(out_full_key)
+                    if isinstance(lora_deltas, _LazyDeltaDict):
+                        # Already reconstructed by __getitem__ above — store precomputed.
+                        _precomputed[out_full_key] = delta
                     fused_qkv_resolved += 1
                     if getattr(self, '_verbose', False):
                         print(f"      🔄 to_out.0→out: {lora_base} → {out_full_key}")
@@ -1524,6 +1706,20 @@ def _find_matching_keys(
 
     print(f"   ✅ Matched {len(matched)} LoRA deltas to checkpoint keys")
 
+    # ── Wrap matched in _MatchedDeltas for on-demand reconstruction ──
+    # When lora_deltas is a _LazyDeltaDict, matched contains _ShapeInfo
+    # values instead of real tensors.  Wrap it in _MatchedDeltas so that
+    # the bake loop can pop() one delta at a time, reconstructing on demand.
+    use_lazy = isinstance(lora_deltas, _LazyDeltaDict)
+    if use_lazy and _precomputed:
+        # Some matched entries (fused QKV, to_out.0) have precomputed
+        # tensors that must be stored directly.  Create the wrapper.
+        lazy_matched = _MatchedDeltas(lora_deltas, _ckpt_to_lora, _precomputed)
+    elif use_lazy:
+        lazy_matched = _MatchedDeltas(lora_deltas, _ckpt_to_lora)
+    else:
+        lazy_matched = matched
+
     if return_stats:
-        return matched, strategy_counts
-    return matched
+        return lazy_matched, strategy_counts
+    return lazy_matched

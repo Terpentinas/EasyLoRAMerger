@@ -66,9 +66,9 @@ const WIDGET_LABEL_RULES = [
     { match: n => ["checkpoint_data", "lora_data"].includes(n),
       emoji: "📦" },
 
-    // ── Debug ──
-    { match: n => n === "debug",
-      emoji: "🔍" },
+    // ── Compatibility mode (Checkpoint Studio) ──
+    { match: n => n === "compatibility_mode",
+      emoji: "🖥️" },
 
     // ── Input model / CLIP / LoRA / checkpoint selectors ──
     { match: n => ["model", "clip", "lora", "lora_name", "checkpoint"].includes(n),

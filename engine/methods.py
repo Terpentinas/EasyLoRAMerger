@@ -22,7 +22,7 @@ except ImportError:
 
 # ==================== SHAPE ADAPTATION UTILITIES ====================
 
-def ensure_shape_match(a, b):
+def ensure_shape_match(a, b, device=None):
     """
     Adjusts tensors a and b to match the larger shape.
     Pads the smaller tensor with zeros to prevent math errors.
@@ -33,8 +33,13 @@ def ensure_shape_match(a, b):
 
     NOTE: When padding occurs, a log message is printed showing the
     original and target shapes for transparency.
+
+    Args:
+        a, b: Input tensors.
+        device: Optional target device. When provided, tensors are moved to
+                this device regardless of their current location.
     """
-    a, b = _unify_dtype_and_device(a, b)
+    a, b = _unify_dtype_and_device(a, b, device=device)
     if a.shape == b.shape:
         return a, b
     
@@ -69,16 +74,25 @@ def ensure_shape_match(a, b):
         print(f"   [pad] Shape mismatch: {orig_a_shape} vs {orig_b_shape} — padded A {a.shape} -> {target_shape}")
         return new_a, b
 
-def _unify_dtype_and_device(a, b):
+def _unify_dtype_and_device(a, b, device=None):
     """
     Ensure two tensors have the same dtype and device.
     Returns (a_unified, b_unified) where dtype is promoted to the higher precision,
-    and device is the same (prefer GPU).
+    and device is the same (respects user's device choice when provided).
+
+    Args:
+        a, b: Input tensors.
+        device: Optional target device. When provided, tensors are moved to
+                this device regardless of their current location. When None,
+                infers device (legacy behavior: CUDA if any tensor is on CUDA,
+                otherwise CPU).
     """
     # Determine target dtype: promote to higher precision
     target_dtype = torch.promote_types(a.dtype, b.dtype)
-    # Determine target device: prefer cuda if any is on cuda and cuda is available, else cpu
-    if (a.device.type == 'cuda' or b.device.type == 'cuda') and torch.cuda.is_available():
+    # Determine target device: respect explicit device parameter when provided
+    if device is not None:
+        target_device = torch.device(device)
+    elif (a.device.type == 'cuda' or b.device.type == 'cuda') and torch.cuda.is_available():
         target_device = torch.device('cuda')
     else:
         target_device = torch.device('cpu')
@@ -87,15 +101,23 @@ def _unify_dtype_and_device(a, b):
     b_unified = b.to(device=target_device, dtype=target_dtype)
     return a_unified, b_unified
 
-def universal_merge_executor(method_fn, a, b, wa, wb, pbar=None, **kwargs):
+def universal_merge_executor(method_fn, a, b, wa, wb, pbar=None, device=None, **kwargs):
     """
     Safety wrapper that ensures shapes match before executing any merge method.
     Prevents "RuntimeError: size mismatch" between different model architectures.
 
-    If pbar is provided, advances it by 1 after each tensor merge.
+    Args:
+        method_fn: Merge function to apply.
+        a, b: Input tensors.
+        wa, wb: Weights for a and b.
+        pbar: Optional progress tracker; advanced by 1 after each merge.
+        device: Optional target device. When provided, tensors are moved to
+                this device regardless of their current location. Respects
+                user's "auto"/"cuda"/"cpu" choice.
+        **kwargs: Additional arguments passed to method_fn.
     """
-    a_unified, b_unified = _unify_dtype_and_device(a, b)
-    a_safe, b_safe = ensure_shape_match(a_unified, b_unified)
+    a_unified, b_unified = _unify_dtype_and_device(a, b, device=device)
+    a_safe, b_safe = ensure_shape_match(a_unified, b_unified, device=device)
     merged = method_fn(a_safe, b_safe, wa, wb, **kwargs)
     if pbar is not None:
         pbar.update(1)
@@ -103,10 +125,14 @@ def universal_merge_executor(method_fn, a, b, wa, wb, pbar=None, **kwargs):
 
 # ==================== ACTIVE REGION BLENDING HELPER ====================
 
-def apply_active_blending(method_fn, a, b, wa, wb, blend_mode="active", **kwargs):
+def apply_active_blending(method_fn, a, b, wa, wb, blend_mode="active", device=None, **kwargs):
     """
     Wrapper that applies merge methods only where tensors are active (non-zero)
     This preserves sparsity patterns and improves cross-trainer blending
+
+    Args:
+        device: Optional target device. Passed through for pipeline consistency;
+                upstream callers ensure tensors arrive on the correct device.
     """
     dtype = a.dtype  # Store original dtype
     

@@ -2,20 +2,23 @@
 Easy LoRA Baker — ComfyUI Node Definition
 
 Bakes a LoRA (or merged LoRA) into a full model checkpoint at the tensor level,
-producing ComfyUI MODEL+CLIP+VAE objects directly in memory with automatic
-RAM Guard fallback to temp disk if system memory is insufficient.
+producing ComfyUI MODEL+CLIP+VAE objects directly.  Lazy assembly via mmap
+means near-zero RAM overhead for preserved keys — no temp files needed.
 
 Features:
   - VAE passthrough & output
   - Per-component scaling (weight_unet, weight_te, weight_clip, weight_vae)
-  - Auto-fallback: RAM Guard falls back to temp disk mode if memory is insufficient
+  - Lazy assembly: baked keys in write cache, preserved keys mmap'd from file
   - Metadata modes: none / preserve_a / merge_basic
   - Expanded precision: auto / float32 / bfloat16 / float16 / fp8_e4m3fn / fp8_e5m2
 """
 
 import torch
 import json
+import time
+_T0 = time.time()
 from pathlib import Path
+from collections import Counter
 
 import folder_paths
 import comfy.sd
@@ -23,15 +26,67 @@ import comfy.sd
 from .utils import (
     load_checkpoint_with_metadata,
     load_lora_with_metadata,
+    read_safetensors_header_only,
     cleanup_memory,
     NodeCache,
-    save_checkpoint_data_to_temp,
     save_safetensors_file,
+    save_safetensors_stream,
     load_state_dict_as_model_objects,
-    check_ram_guard,
+    get_available_ram,
 )
-from .config import PRECISION_OPTIONS, DEVICE_OPTIONS, DevicePrecisionConfig
+from .config import PRECISION_EXTENDED, DEVICE_OPTIONS, DevicePrecisionConfig
 from .engine.baking_processor import SmartBakingProcessor
+
+
+# ===================================================================
+# FP8 metadata helpers — imported from shared fp8_quantizer module
+# (One Pattern Per Concept — working_principles.md)
+# ===================================================================
+from .engine.fp8_quantizer import (
+    build_fp8_quantization_metadata as _build_fp8_quantization_metadata,
+    strip_input_scale_keys as _strip_input_scale_keys,
+)
+
+
+# ===================================================================
+# Auto-precision helper: detect checkpoint's native weight dtype
+# ===================================================================
+def _detect_native_ckpt_dtype(ckpt_header: dict) -> "torch.dtype | None":
+    """Detect the dominant weight dtype from the safetensors header.
+
+    Scans all tensor entries in the header, skipping scale-factor keys
+    (.weight_scale, .input_scale), and finds the most common floating-point
+    dtype.  Only float types (float16, bfloat16, float32, float8_e4m3fn,
+    float8_e5m2) are considered — int/bool tensors are excluded since they
+    are not precision targets for weight computation.
+
+    Returns:
+        The most common torch.dtype among float weight tensors, or None
+        if no float tensors are found.
+    """
+    from .engine.key_utils import SAFETENSORS_DTYPE_MAP as _SAFETENSORS_DTYPE_MAP
+
+    _FLOAT_DTYPES = {
+        torch.float16, torch.bfloat16, torch.float32,
+        torch.float8_e4m3fn, torch.float8_e5m2,
+    }
+
+    dtype_counter: Counter = Counter()
+    for key, info in ckpt_header.items():
+        if not isinstance(info, dict):
+            continue
+        if key.endswith((".weight_scale", ".input_scale", ".comfy_quant")):
+            continue
+        dtype_str = info.get("dtype", "")
+        if not dtype_str:
+            continue
+        dtype = _SAFETENSORS_DTYPE_MAP.get(dtype_str)
+        if dtype is not None and dtype in _FLOAT_DTYPES:
+            dtype_counter[dtype] += 1
+
+    if dtype_counter:
+        return dtype_counter.most_common(1)[0][0]
+    return None
 
 
 class SmartModelBaker:
@@ -68,7 +123,8 @@ class SmartModelBaker:
         checkpoints = folder_paths.get_filename_list("checkpoints")
         loras = folder_paths.get_filename_list("loras")
         return {
-            "required": {
+            "required": {},
+            "optional": {
                 # ── SECTION 1: INPUTS ───────────────────────────────────
                 "checkpoint": (checkpoints,),
                 # Wired LORA overrides dropdown — when lora_data is connected, lora_name is ignored
@@ -107,7 +163,7 @@ class SmartModelBaker:
 
                 # ── SECTION 5: HARDWARE ─────────────────────────────────
                 "device": (DEVICE_OPTIONS, {"default": "auto"}),
-                "precision": (PRECISION_OPTIONS, {"default": "auto"}),
+                "precision": (PRECISION_EXTENDED, {"default": "auto"}),
                 "batch_size": ("INT", {
                     "default": 64, "min": 1, "max": 256, "step": 8,
                     "tooltip": "Number of keys to process per batch. Larger = faster but more VRAM. "
@@ -204,15 +260,24 @@ class SmartModelBaker:
         print(f"   🧱 Weights — UNet:{weight_unet} TE:{weight_te} CLIP:{weight_clip} VAE:{weight_vae}")
         print(f"   💾 Preview: RAM mode with RAM Guard, Metadata: {metadata_mode}")
         
+        # ══ Runtime precision guard — protect against stale workflow JSONs ══
+        if precision not in PRECISION_EXTENDED:
+            print(f"   ⚠️ Precision '{precision}' is no longer available, falling back to 'auto'")
+            precision = "auto"
+        
         # Default return values
         save_path = ""
         model_out = None
         clip_out = None
         vae_out = None
         forensic_report = ""
-        temp_path = None  # For preview mode temp file cleanup
-        
         # Validate inputs
+        if not checkpoint:
+            error_msg = "❌ No checkpoint selected — please choose a checkpoint from the dropdown"
+            print(error_msg)
+            forensic_report = json.dumps({"error": error_msg}, indent=2)
+            return (model_out, clip_out, vae_out, save_path, forensic_report)
+
         if lora_data is None and (lora_name == "None" or not lora_name):
             error_msg = "❌ Either lora_data or lora_name must be provided"
             print(error_msg)
@@ -230,8 +295,55 @@ class SmartModelBaker:
                 ckpt_path = checkpoint
             ckpt_path = Path(ckpt_path)
             
-            ckpt_sd, ckpt_metadata = load_checkpoint_with_metadata(ckpt_path)
-            print(f"   ✅ Loaded checkpoint: {len(ckpt_sd)} keys")
+            # RAM Guard (informational): Log file size for diagnostics.
+            # With mmap-based lazy loading, the checkpoint file is never fully
+            # loaded into RAM. Only individual tensors are loaded on demand via
+            # safe_open (mmap). A 17 GiB checkpoint uses ~50 KB for the header.
+            ckpt_file_size = ckpt_path.stat().st_size
+            print(f"   📦 Checkpoint file: {ckpt_file_size / (1024**3):.2f} GB on disk")
+            
+            # Use mmap-based lazy loading: read only the safetensors header JSON
+            # (~50 KB), then wrap the file in a dict-like lazy mapping.
+            # Tensors are loaded on demand when ckpt_sd[key] is first accessed.
+            ckpt_header, ckpt_metadata = read_safetensors_header_only(ckpt_path)
+
+            # 🔥 FP8 DETECTION: Check if any checkpoint tensor uses FP8 dtype.
+            # FP8 e4m3fn has only 3 mantissa bits — step size ~0.125 at magnitude
+            # 1.0, which is 64× coarser than a typical LoRA delta (~0.002).
+            # We dequantize to bfloat16 for all baking computation, then
+            # quantize once at final output (if the user selected fp8 precision).
+            # Safetensors header uses short dtype strings: "F8_E4M3" for fp8_e4m3fn,
+            # "F8_E5M2" for fp8_e5m2 (see _SAFETENSORS_DTYPE_MAP in musubi_checkpoint_studio.py).
+            # Check for the "F8_" prefix which is unique to FP8 dtypes.
+            detected_fp8 = any(
+                info.get('dtype', '').startswith('F8_')
+                for info in ckpt_header.values()
+                if isinstance(info, dict)
+            )
+            if detected_fp8:
+                print(f"   🚀 FP8 checkpoint detected — dequantizing to bfloat16 for baking precision")
+                # Strip stale quantization metadata that tells ComfyUI to use
+                # its slow mixed-precision path.  Since we dequantize to bf16,
+                # this metadata is stale and would trigger incorrect behavior.
+                # Secondary cleanup also happens in _build_metadata (Fix 6).
+                fp8_meta_keys = [k for k in list(ckpt_metadata.keys())
+                                 if 'quantization' in k.lower()]
+                for k in fp8_meta_keys:
+                    del ckpt_metadata[k]
+                if fp8_meta_keys:
+                    print(f"   🧹 Stripped {len(fp8_meta_keys)} quantization metadata keys")
+
+            from .engine.musubi_checkpoint_studio import MusubiCheckpointStudio
+            # 🔥 Pass target_dtype=bf16 for FP8 checkpoints so that __getitem__
+            # applies per-channel scale factors during fp8→bf16 dequantization.
+            # Without this, _safe_bake_add receives raw fp8 tensors and its naive
+            # base.to(dtype=compute_dtype) cast ignores the per-channel scale
+            # factors, producing completely wrong weight values (pure noise).
+            ckpt_sd = MusubiCheckpointStudio._LazyCheckpointMapping(
+                ckpt_path, ckpt_metadata,
+                target_dtype=torch.bfloat16 if detected_fp8 else None,
+            )
+            print(f"   ✅ Lazily mapped checkpoint: {len(ckpt_header)} keys via mmap (0 bytes loaded)")
         except Exception as e:
             error_msg = f"❌ Failed to load checkpoint: {e}"
             print(error_msg)
@@ -294,12 +406,30 @@ class SmartModelBaker:
         # Step 3-9: Run baking pipeline
         # ------------------------------------------------------------------
         print("\n🔨 Running baking pipeline...")
+
+        # 🎯 Auto-precision: detect checkpoint native dtype and use it
+        if precision == "auto":
+            native_dtype = _detect_native_ckpt_dtype(ckpt_header)
+            if native_dtype is not None:
+                _DTYPE_TO_PRECISION = {
+                    torch.float8_e4m3fn: "fp8_e4m3fn",
+                    torch.float8_e5m2:   "fp8_e5m2",
+                    torch.bfloat16:      "bfloat16",
+                    torch.float16:       "float16",
+                    torch.float32:       "float32",
+                }
+                mapped = _DTYPE_TO_PRECISION.get(native_dtype)
+                if mapped:
+                    precision = mapped
+                    print(f"   🎯 Auto precision: detected {native_dtype} → using {mapped}")
+
         try:
             dpc = DevicePrecisionConfig(device_type=device, precision=precision)
             processor = SmartBakingProcessor(device_precision=dpc)
             
             output_sd, metadata, forensic_report, _ = processor.bake(
                 ckpt_sd=ckpt_sd,
+                ckpt_header=ckpt_header,
                 lora_sd=lora_sd,
                 baking_method=baking_method,
                 batch_size=batch_size,
@@ -312,7 +442,9 @@ class SmartModelBaker:
                 weight_clip=weight_clip,
                 weight_vae=weight_vae,
                 metadata_mode=metadata_mode,
+                detected_fp8=detected_fp8,
             )
+            print(f"   🕐 [t={time.time()-_T0:.1f}s] Baking pipeline returned to baker_node — output_sd type: {type(output_sd).__name__}")
         except Exception as e:
             error_msg = f"❌ Baking pipeline failed: {e}"
             print(error_msg)
@@ -325,29 +457,63 @@ class SmartModelBaker:
         # Step 10-11: Output as MODEL+CLIP+VAE with conditional save
         # ------------------------------------------------------------------
         print(f"\n💾 save_trigger={save_trigger}")
-        
+
+        # ── Measure pre-load RAM for post-load delta ──
+        _pre_load_ram = get_available_ram()
+
         if save_trigger:
             # === Save Mode: permanent disk save + lazy load from file ===
-            print("Saving baked checkpoint to disk permanently...")
-            output_path, save_path = save_safetensors_file(
-                output_sd, save_folder, filename, metadata=metadata,
-                folder_type="checkpoints", default_name="baked_checkpoint",
-            )
-            if output_path is None:
-                # save_safetensors_file already printed the error
-                forensic_report = json.dumps({"error": save_path}, indent=2)
-                return (None, None, None, save_path, forensic_report)
-            
-            # Free in-memory state dict BEFORE loading model objects (low RAM)
-            print("   🧹 Freeing in-memory state dict...")
-            cleanup_memory(output_sd)
-            
-            # Load MODEL+CLIP+VAE lazily from the saved file
+            from .engine.musubi_checkpoint_studio import MusubiCheckpointStudio
+
+            # 🎯 FP8 SAVE: Build _quantization_metadata for MixedPrecisionOps.
+            # This runs before the if-else dispatch so ALL save paths benefit.
+            metadata = _build_fp8_quantization_metadata(output_sd, metadata, label="save")
+
+            if isinstance(output_sd, MusubiCheckpointStudio._LazyCheckpointMapping):
+                # ── Lazy assembly mode (Fix 1): baked keys in write cache ──
+                # output_sd.filepath points to the ORIGINAL checkpoint, NOT the
+                # baked output.  Must materialize all keys to a new file.
+                print("Saving baked checkpoint to disk (lazy assembly — materializing to file)...")
+                from .utils import _get_output_path
+                output_path = _get_output_path(
+                    save_folder, filename, "baked_checkpoint", "checkpoints"
+                )
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                # Materialize all keys (write cache + lazy reads from original file)
+                all_tensors = dict(output_sd.items())
+                # 🎯 FP8 SAVE: Strip .input_scale (MixedPrecisionOps only needs .weight_scale)
+                _strip_input_scale_keys(all_tensors)
+                save_safetensors_stream(all_tensors, output_path, metadata=metadata)
+                del all_tensors
+                save_path = str(output_path)
+                file_size_mb = output_path.stat().st_size / (1024 * 1024)
+                print(f"   ✅ Saved: {output_path} ({file_size_mb:.1f} MB)")
+                # Fix 2: Close the lazy mapping permanently — no more reads from original
+                output_sd.permanent_close()
+                cleanup_memory()
+
+            else:
+                # ── Dict mode: use existing save_safetensors_file path ──
+                print("Saving baked checkpoint to disk permanently...")
+                output_path, save_path = save_safetensors_file(
+                    output_sd, save_folder, filename, metadata=metadata,
+                    folder_type="checkpoints", default_name="baked_checkpoint",
+                )
+                if output_path is None:
+                    # save_safetensors_file already printed the error
+                    forensic_report = json.dumps({"error": save_path}, indent=2)
+                    return (None, None, None, save_path, forensic_report)
+                # Free in-memory state dict BEFORE loading model objects (low RAM)
+                print("   🧹 Freeing in-memory state dict...")
+                cleanup_memory(output_sd)
+
+            # ── Common model loading for all save modes (Fix 5) ──
             print(f"\n📦 Loading baked checkpoint as MODEL+CLIP+VAE (lazy from file)...")
+            lazy_mapping = None
             try:
-                from .engine.musubi_checkpoint_studio import MusubiCheckpointStudio
                 lazy_mapping = MusubiCheckpointStudio._LazyCheckpointMapping(
-                    output_path, metadata
+                    output_path, metadata,
+                    target_dtype=None,  # 🎯 MixedPrecisionOps handles dequant via _quantization_metadata
                 )
                 model_out, clip_out, vae_out = load_state_dict_as_model_objects(
                     lazy_mapping, metadata=metadata,
@@ -356,87 +522,73 @@ class SmartModelBaker:
             except Exception as e:
                 print(f"   ⚠️ Failed to load baked checkpoint as model objects: {e}")
                 print(f"   ℹ️  The checkpoint was saved successfully at: {save_path}")
-                # model_out, clip_out, vae_out remain None
+            finally:
+                # Fix 5: Close the mapping permanently after model objects are built.
+                # This prevents __del__ from reopening the file handle during GC,
+                # eliminating post-prompt file I/O on stale lazy mappings.
+                if lazy_mapping is not None:
+                    lazy_mapping.permanent_close()
         
         else:
-            # === Preview Mode (RAM with RAM Guard): in-memory load, auto-fallback to temp disk ===
-            print("Preview mode — checking memory before in-memory load...")
-            total_data_bytes = sum(
-                t.numel() * t.element_size() for t in output_sd.values()
-            )
-            use_temp_fallback = not check_ram_guard(
-                total_bytes=total_data_bytes,
-                num_tensors=len(output_sd),
-                batch_size=batch_size,
-                label="baking preview",
-            )
-            
-            if use_temp_fallback:
-                # Fallback: save to temp file + lazy load from temp
-                temp_path = save_checkpoint_data_to_temp(output_sd, "baked_preview", metadata=metadata)
-                if temp_path is not None:
-                    try:
-                        print(f"   📁 Writing temp file: {temp_path}")
-                        # Free in-memory state dict
-                        cleanup_memory(output_sd)
-                        # Lazy load from temp file
-                        from .engine.musubi_checkpoint_studio import MusubiCheckpointStudio
-                        lazy_mapping = MusubiCheckpointStudio._LazyCheckpointMapping(
-                            temp_path, metadata
-                        )
-                        model_out, clip_out, vae_out = load_state_dict_as_model_objects(
-                            lazy_mapping, metadata=metadata,
-                        )
-                        print(f"   ✅ Loaded MODEL + CLIP + VAE from temp file (RAM-safe preview)")
-                    except Exception as e2:
-                        print(f"   ⚠️ Temp fallback failed: {e2}")
-                        if 'output_sd' not in locals() or output_sd is None:
-                            error_msg = f"❌ Preview mode failed (temp fallback + memory exhausted): {e2}"
-                            print(error_msg)
-                            forensic_report = json.dumps({"error": error_msg}, indent=2)
-                            return (None, None, None, "", forensic_report)
-                        print(f"   ℹ️  Falling through to in-memory load attempt")
-                        try:
-                            model_out, clip_out, vae_out = load_state_dict_as_model_objects(
-                                output_sd, metadata=metadata,
-                            )
-                            print(f"   ✅ Loaded MODEL + CLIP + VAE from baked state dict (in-memory fallback)")
-                        except Exception as e:
-                            error_msg = f"❌ In-memory load fallback also failed: {e}"
-                            print(error_msg)
-                            import traceback
-                            traceback.print_exc()
-                            forensic_report = json.dumps({"error": error_msg}, indent=2)
-                            return (None, None, None, "", forensic_report)
-            else:
-                # Direct in-memory load from state dict
-                try:
-                    model_out, clip_out, vae_out = load_state_dict_as_model_objects(
-                        output_sd, metadata=metadata,
-                    )
-                    print(f"   ✅ Loaded MODEL + CLIP + VAE from baked state dict (in-memory)")
-                    # Free state dict after loading to recover memory
-                    cleanup_memory(output_sd)
-                except Exception as e:
-                    error_msg = f"❌ In-memory model load failed: {e}"
-                    print(error_msg)
-                    import traceback
-                    traceback.print_exc()
-                    forensic_report = json.dumps({"error": error_msg}, indent=2)
-                    return (None, None, None, "", forensic_report)
-            
+            # === Preview Mode: load as MODEL+CLIP+VAE directly ===
+            # output_sd is a lazy mapping (from _assemble_output_lazy) or a real dict
+            # (from _assemble_output for non-lazy mode). Lazy mappings have near-zero
+            # RAM overhead — no temp file fallback needed.
+            print("Preview mode — loading as MODEL+CLIP+VAE...")
+            try:
+                # 🎯 FP8 PREVIEW: Use MixedPrecisionOps instead of eager dequant.
+                # Unified detection: works for BOTH lazy mappings (has _user_fp8_mode flag)
+                # and real dicts (check for FP8 tensor dtype).
+                _has_fp8 = getattr(output_sd, '_user_fp8_mode', False) or any(
+                    hasattr(v, 'dtype') and v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                    for v in output_sd.values()
+                )
+                if _has_fp8:
+                    # Step 1: Pop .input_scale keys (MixedPrecisionOps
+                    # only needs .weight_scale — .input_scale would appear as
+                    # 'unet unexpected' keys)
+                    _strip_input_scale_keys(output_sd)
+
+                    # Step 2: Build _quantization_metadata from the mapping.
+                    metadata = _build_fp8_quantization_metadata(output_sd, metadata, label="preview")
+
+                print(f"   🕐 [t={time.time()-_T0:.1f}s] Starting model loading — load_state_dict_as_model_objects")
+                model_out, clip_out, vae_out = load_state_dict_as_model_objects(
+                    output_sd, metadata=metadata,
+                )
+                mode_label = "lazy (mmap)" if hasattr(output_sd, 'filepath') else "in-memory"
+                print(f"   ✅ Loaded MODEL + CLIP + VAE from baked state dict ({mode_label})")
+                print(f"   🕐 [t={time.time()-_T0:.1f}s] Model loading complete — MODEL+CLIP+VAE ready")
+                # Free state dict after loading to recover memory
+                cleanup_memory(output_sd)
+                # Close lazy mapping to prevent stale file handles
+                if hasattr(output_sd, 'filepath'):
+                    output_sd.permanent_close()
+            except Exception as e:
+                error_msg = f"❌ In-memory model load failed: {e}"
+                print(error_msg)
+                import traceback
+                traceback.print_exc()
+                forensic_report = json.dumps({"error": error_msg}, indent=2)
+                return (None, None, None, "", forensic_report)
+
             save_path = ""  # No permanent save path in preview mode
         
-        # Cleanup: free temp file if used (preview modes)
-        if not save_trigger and temp_path is not None and temp_path.exists():
-            try:
-                temp_path.unlink()
-                print(f"   🧹 Removed temp file: {temp_path}")
-            except Exception:
-                pass
-        
-        cleanup_memory()
-        
+        # SSD Fix: skip gc.collect() at end of bake — GC already ran naturally
+        # during the pipeline.  Calling gc.collect() here triggers __del__ on
+        # stale objects at unpredictable times, causing unexpected file I/O.
+        cleanup_memory(skip_gc=True)
+
+        # ── Measure post-load RAM and print delta ──
+        _post_load_ram = get_available_ram()
+        if _pre_load_ram is not None and _post_load_ram is not None:
+            _delta_gb = (_pre_load_ram - _post_load_ram) / (1024**3)
+            print(f"📊 RAM: Pre-load {_pre_load_ram / (1024**3):.2f} GB → "
+                  f"Post-load {_post_load_ram / (1024**3):.2f} GB "
+                  f"(delta: {_delta_gb:+.2f} GB)")
+        elif _post_load_ram is not None:
+            print(f"📊 Post-load available RAM: {_post_load_ram / (1024**3):.2f} GB")
+
         print("\n" + "=" * 60)
         print("✅ Easy LoRA Baker complete!")
         if save_trigger:
@@ -444,10 +596,11 @@ class SmartModelBaker:
             if model_out is not None:
                 print(f"   📦 Loaded MODEL + CLIP + VAE from saved file (lazy)")
         else:
-            print(f"   🧠 Preview mode (RAM with RAM Guard) — no disk save")
+            print(f"   🧠 Preview mode — no disk save")
             if model_out is not None:
                 print(f"   📦 Loaded baked MODEL + CLIP + VAE in memory")
             print(f"   ℹ️  Set save_trigger=True to save permanently to disk")
         print("=" * 60)
         
+        print(f"   🕐 [t={time.time()-_T0:.1f}s] baker_node.bake returning")
         return (model_out, clip_out, vae_out, save_path, forensic_report)

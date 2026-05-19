@@ -10,11 +10,9 @@ from pathlib import Path
 import time
 import json
 import hashlib
-import os
 from typing import Dict, Optional
 
 import torch
-from safetensors.torch import save_file
 from safetensors import safe_open
 
 import folder_paths
@@ -22,7 +20,7 @@ import comfy.sd
 
 # Local imports
 try:
-    from ..config import PRECISION_OPTIONS, DEVICE_OPTIONS
+    from ..config import PRECISION_STUDIO, DEVICE_OPTIONS, FORMAT_OPTIONS
     from ..utils import (
         load_lora_with_metadata,
         get_experiment_temp_path,
@@ -35,9 +33,12 @@ try:
         save_safetensors_stream,
         ThreadSafeCleanup,
         check_ram_guard,
+        print_ram_delta,
+        memory_guard,
+        read_safetensors_header_only,
     )
 except ImportError:
-    from config import PRECISION_OPTIONS, DEVICE_OPTIONS
+    from config import PRECISION_STUDIO, DEVICE_OPTIONS, FORMAT_OPTIONS
     from utils import (
         load_lora_with_metadata,
         get_experiment_temp_path,
@@ -50,7 +51,47 @@ except ImportError:
         save_safetensors_stream,
         ThreadSafeCleanup,
         check_ram_guard,
+        print_ram_delta,
+        memory_guard,
+        read_safetensors_header_only,
     )
+
+# FP8 quantization — shared module (single source of truth)
+from .fp8_quantizer import (
+    FP8_PRESERVE_BF16_PATTERNS as _FP8_PRESERVE_BF16_PATTERNS_MODULE,
+    should_preserve_bf16,
+    compute_weight_scale,
+    quantize_to_fp8,
+    dequant_fp8_tensor,
+    get_dequant_dtype,
+)
+
+# INT8 quantization — per-channel symmetric quantization for legacy GPUs
+from .int8_quantizer import (
+    compute_int8_scale,
+    quantize_to_int8,
+    dequant_int8_tensor,
+    quantize_weight_to_int8_with_scales,
+    should_skip_int8 as _should_skip_int8_module,
+    should_preserve_fp16_for_int8 as _should_preserve_fp16_for_int8_module,
+)
+
+# SVD preservation — ALL SVD logic (patterns, thresholds, decomposition, preprocessing)
+# Single source of truth: engine/svd_quantizer.py
+from .svd_quantizer import (
+    should_skip_svd,
+    get_svd_threshold,
+    apply_svd_to_tensor,
+    apply_svd_preprocess,
+)
+
+# GGUF writer — block-wise quantization output for ComfyUI-GGUF
+from .gguf_writer import (
+    GGUFSaveWriter,
+    gguf_arch_from_arch,
+    is_gguf_precision,
+    GGUF_SUPPORTED_ARCHS,
+)
 
 try:
     from .metadata_factory import finalize_metadata
@@ -63,23 +104,7 @@ except ImportError:
     try:
         from checkpoint_normalizer import detect_checkpoint_architecture
     except ImportError:
-        # Fallback: define a simple version if module not available
-        def detect_checkpoint_architecture(keys):
-            if any("net.blocks" in k for k in keys):
-                return "Anima"
-            elif any("double_blocks" in k or "single_blocks" in k for k in keys):
-                return "Flux"
-            elif any("cap_embedder" in k for k in keys):
-                return "Lumina2"
-            elif any("z_image" in k.lower() for k in keys):
-                return "Z-Image"
-            elif any("layers" in k and "attention" in k for k in keys):
-                return "Z-Image"
-            elif any("model.diffusion_model" in k for k in keys):
-                return "SDXL"
-            elif any("diffusion_model" in k for k in keys):
-                return "SD1.5"
-            return "Unknown"
+        detect_checkpoint_architecture = None  # Signal "no fallback available"
 
 # Module-level constant for architecture display name mapping
 ARCHITECTURE_DISPLAY_MAP = {
@@ -125,7 +150,17 @@ class MusubiCheckpointStudio:
                                            "tooltip": "Remove CLIP visual encoder (if present)"}),
 
                 # ── SECTION 5: HARDWARE ─────────────────────────────────
-                "precision": (PRECISION_OPTIONS, {"default": "auto"}),
+                "precision": (PRECISION_STUDIO, {
+                    "default": "auto",
+                    "tooltip": "Precision: int8 / int8_convrot save ~50% smaller files but require "
+                               "ComfyUI-Flux2-INT8 custom node to load. ConvRot uses Hadamard "
+                               "rotation for better quality at the same file size.",
+                }),
+                "output_format": (FORMAT_OPTIONS, {
+                    "default": "safetensors",
+                    "tooltip": "Output file format: safetensors (standard) or GGUF with "
+                               "block-wise quantization (load with ComfyUI-GGUF nodes).",
+                }),
                 "device": (DEVICE_OPTIONS, {"default": "auto"}),
 
                 # ── SECTION 6: OUTPUT ───────────────────────────────────
@@ -147,8 +182,6 @@ class MusubiCheckpointStudio:
                 # ── SECTION 6: OUTPUT (continued) ───────────────────────
                 "save_folder": ("STRING", {"default": default_folder, "multiline": False}),
 
-                # ── DEBUG ───────────────────────────────────────────────
-                "debug": ("BOOLEAN", {"default": False, "tooltip": "Show detailed conversion info"}),
             },
             "hidden": {
                 "node_id": "UNIQUE_ID"
@@ -174,45 +207,20 @@ class MusubiCheckpointStudio:
         key_str = str(cache_key).encode('utf-8')
         return hashlib.md5(key_str).hexdigest()
 
-    @staticmethod
-    def _is_vae_key(key: str) -> bool:
-        """Return True if key belongs to VAE component.
-
-        Delegates to :func:`engine.key_utils.is_vae_key`.
-        """
-        from ..engine.key_utils import is_vae_key as _is_vae
-        return _is_vae(key)
-
-    @staticmethod
-    def _is_te_key(key: str) -> bool:
-        """Return True if key belongs to Text Encoder (CLIP/T5).
-
-        Delegates to :func:`engine.key_utils.is_te_key`.
-        """
-        from ..engine.key_utils import is_te_key as _is_te
-        return _is_te(key)
-
-    @staticmethod
-    def _is_clip_key(key: str) -> bool:
-        """Return True if key belongs to CLIP visual encoder.
-
-        Delegates to :func:`engine.key_utils.is_clip_key`.
-        """
-        from ..engine.key_utils import is_clip_key as _is_clip
-        return _is_clip(key)
-
     # ── Shared helper methods (used by both inner classes and outer methods) ──
 
     @staticmethod
     def _should_strip_key(key, strip_vae, strip_te, strip_clip, stripped_counts):
         """Check if a key should be stripped and increment the counter. Returns True if stripped."""
-        if strip_vae and MusubiCheckpointStudio._is_vae_key(key):
+        from ..engine.key_utils import is_vae_key, is_te_key, is_clip_key
+
+        if strip_vae and is_vae_key(key):
             stripped_counts["vae"] += 1
             return True
-        if strip_te and MusubiCheckpointStudio._is_te_key(key):
+        if strip_te and is_te_key(key):
             stripped_counts["te"] += 1
             return True
-        if strip_clip and MusubiCheckpointStudio._is_clip_key(key):
+        if strip_clip and is_clip_key(key):
             stripped_counts["clip"] += 1
             return True
         return False
@@ -224,36 +232,153 @@ class MusubiCheckpointStudio:
         component_counts[component] = component_counts.get(component, 0) + 1
         parameter_counts[component] = parameter_counts.get(component, 0) + numel
 
+    # 🔥 FP8 IMPROVEMENT: Patterns that should be preserved in BF16 instead of quantized to FP8
+    #
+    # Creator's FP8 selectively keeps critical layers in BF16:
+    #   - Input projections: img_in, time_in, txt_in, vector_in, guidance_in
+    #   - Output projections: final_layer
+    #   - Modulation layers: single_stream_modulation, double_stream_modulation_*
+    #   - Norm scale/bias tensors
+    #
+    # Patterns support two key formats:
+    #   - Diffusers-style: uses '/' path separators (model/diffusion_model/...)
+    #   - FLUX-style: uses '.' dot notation (double_blocks.0.img_attn...)
+    # Delegated to engine/fp8_quantizer.py — single source of truth.
+    _FP8_PRESERVE_BF16_PATTERNS = _FP8_PRESERVE_BF16_PATTERNS_MODULE
+
     @staticmethod
-    def _resolve_output_path(save_folder, filename):
-        """Determine output path with auto-increment dedup logic."""
+    def _should_preserve_bf16(key: str) -> bool:
+        """Return True if this key should stay in BF16 when target precision is FP8.
+
+        Delegated to engine/fp8_quantizer.should_preserve_bf16().
+        """
+        return should_preserve_bf16(key)
+
+    @staticmethod
+    def _build_quantization_metadata(tensor_list: list, fp8_dtype_str: str) -> dict:
+        """Build _quantization_metadata dict describing the FP8 quantization format.
+
+        Args:
+            tensor_list: The list of tensor entries from survey, including scale tensors.
+            fp8_dtype_str: "F8_E4M3" or "F8_E5M2"
+
+        Returns:
+            Dict with format_version and per-layer quantization format info,
+            or empty dict if no FP8 tensors are present.
+        """
+        # Map our dtype strings to inference-engine format names
+        format_map = {
+            "F8_E4M3": "float8_e4m3fn",
+            "F8_E5M2": "float8_e5m2",
+        }
+        fp8_format = format_map.get(fp8_dtype_str, "float8_e4m3fn")
+
+        # Collect all FP8 weight keys (exclude scale tensors themselves)
+        fp8_layers = {}
+        for item in tensor_list:
+            key = item.get('new_key', item.get('original_key', ''))
+            dtype_str = item['dtype']
+            if dtype_str in ("F8_E4M3", "F8_E5M2") and not key.endswith(('.weight_scale', '.input_scale')):
+                # Strip trailing .weight/.bias to get base layer name
+                for suffix in ('.weight', '.bias'):
+                    if key.endswith(suffix):
+                        layer_name = key[:-len(suffix)]
+                        break
+                else:
+                    layer_name = key
+                fp8_layers[layer_name] = {
+                    "format": fp8_format,
+                }
+
+        if not fp8_layers:
+            return {}
+
+        return {
+            "format_version": "1.0",
+            "layers": fp8_layers,
+        }
+
+    @staticmethod
+    def _compute_weight_scale(tensor: torch.Tensor, target_dtype: torch.dtype) -> torch.Tensor:
+        """Compute the per-tensor weight_scale for FP8 quantization.
+
+        Delegated to engine/fp8_quantizer.compute_weight_scale().
+        """
+        return compute_weight_scale(tensor, target_dtype)
+
+    @staticmethod
+    def _quantize_to_fp8(tensor: torch.Tensor, fp8_dtype: torch.dtype) -> torch.Tensor:
+        """Quantize tensor to FP8 using scale-then-cast (matching Creator's algorithm).
+
+        Delegated to engine/fp8_quantizer.quantize_to_fp8().
+        """
+        return quantize_to_fp8(tensor, fp8_dtype)
+
+    @staticmethod
+    def _should_skip_int8(key: str) -> bool:
+        """Return True if this key should skip INT8 quantization (LoRA weights etc.).
+
+        Delegated to engine/int8_quantizer.should_skip_int8().
+        """
+        return _should_skip_int8_module(key)
+
+    @staticmethod
+    def _should_preserve_fp16_for_int8(key: str) -> bool:
+        """Return True if this key should stay in FP16 when target precision is INT8.
+
+        INT8 has zero mantissa bits — input projections (img_in, time_in, txt_in),
+        output layers (final_layer), and modulation tensors are the most sensitive
+        to quantization error. Mirrors FP8's ``should_preserve_bf16()``.
+
+        For INT8 dequant math (``int8 * scale``), FP16's 10 mantissa bits produce
+        more accurate results than BF16's 7 mantissa bits — so FP16 is universally
+        correct regardless of GPU generation (Pascal/Turing/Ampere+).
+
+        Delegated to engine/int8_quantizer.should_preserve_fp16_for_int8().
+        """
+        return _should_preserve_fp16_for_int8_module(key)
+
+    @staticmethod
+    def _resolve_output_path(save_folder, filename, extension=".safetensors"):
+        """Determine output path with auto-increment dedup logic.
+
+        Args:
+            save_folder: Output directory path.
+            filename: Base filename (may include existing extension).
+            extension: Desired file extension, e.g. ``.safetensors`` or ``.gguf``.
+        """
         if save_folder:
             output_folder = Path(save_folder)
         else:
             checkpoint_folders = folder_paths.get_folder_paths("checkpoints")
             output_folder = Path(checkpoint_folders[0]) if checkpoint_folders else Path.cwd()
         output_folder.mkdir(parents=True, exist_ok=True)
-        base_name = filename.replace('.safetensors', '')
-        output_path = output_folder / f"{base_name}_converted.safetensors"
+        base_name = filename.rsplit('.', 1)[0]  # strip any existing extension
+        output_path = output_folder / f"{base_name}_converted{extension}"
         counter = 1
         while output_path.exists():
-            output_path = output_folder / f"{base_name}_converted_{counter}.safetensors"
+            output_path = output_folder / f"{base_name}_converted_{counter}{extension}"
             counter += 1
         return output_path
 
     @staticmethod
-    def _format_ui_summary(tensor_count, target_dtype, quality_pct, stripped_counts, svd_info):
+    def _format_ui_summary(tensor_count, target_dtype, quality_pct, stripped_counts, svd_info,
+                           output_format="safetensors"):
         """Build a compact UI summary string."""
-        ui_summary = f"[{tensor_count} tensors, {target_dtype}]"
+        if output_format.startswith("gguf_"):
+            format_label = output_format.replace("gguf_", "GGUF ").upper()
+            ui_summary = f"[{tensor_count} tensors, {format_label}]"
+        else:
+            ui_summary = f"[{tensor_count} tensors, {target_dtype}]"
         if quality_pct is not None:
             ui_summary += f" Q:{quality_pct}%"
         if any(stripped_counts.values()):
             ui_summary += f" stripped:{stripped_counts['vae']}vae{stripped_counts['te']}te{stripped_counts['clip']}clip"
         if svd_info and svd_info.get('svd_applied', False):
+            rank_ratio = svd_info.get('avg_rank_ratio', 0)
             ui_summary += f" svd:{svd_info.get('compressed_layers', 0)}layers"
-            size_saved = svd_info.get('size_saved_mb', 0)
-            if size_saved:
-                ui_summary += f",{size_saved:.1f}MB"
+            if rank_ratio > 0:
+                ui_summary += f",rr={rank_ratio:.3f}"
         return ui_summary
 
     @staticmethod
@@ -286,615 +411,292 @@ class MusubiCheckpointStudio:
             new_size_bytes = base_bytes
         return (base_bytes - new_size_bytes) / (1024**3)
 
-    class _SafetensorsStreamWriter:
-        """
-        Two‑pass incremental writer for safetensors checkpoints.
-        """
-        @staticmethod
-        def _read_header(filepath):
-            """
-            Read safetensors header from file, return dict with shape/dtype per key.
-            """
-            with open(filepath, 'rb') as f:
-                magic = f.read(8)
-                if magic != b'__safet':
-                    raise ValueError('Not a safetensors file')
-                header_size_bytes = f.read(8)
-                if len(header_size_bytes) != 8:
-                    raise ValueError('Invalid header size')
-                header_size = int.from_bytes(header_size_bytes, 'little')
-                header_bytes = f.read(header_size)
-                header = json.loads(header_bytes)
-                # Filter out '__metadata__'
-                tensors = {k: v for k, v in header.items() if k != '__metadata__'}
-                return tensors, header.get('__metadata__', {})
-
-        # Mapping from safetensors dtype strings to torch dtypes and element sizes
-        DTYPE_MAP = {
-            "F64": (torch.float64, 8),
-            "F32": (torch.float32, 4),
-            "F16": (torch.float16, 2),
-            "BF16": (torch.bfloat16, 2),
-            "F8_E4M3": (torch.float8_e4m3fn, 1),
-            "F8_E5M2": (torch.float8_e5m2, 1),
-            "I64": (torch.int64, 8),
-            "I32": (torch.int32, 4),
-            "I16": (torch.int16, 2),
-            "I8": (torch.int8, 1),
-            "U8": (torch.uint8, 1),
-            "BOOL": (torch.bool, 1),
-        }
-        # Reverse mapping: torch dtype -> safetensors dtype string
-        DTYPE_MAP_REVERSE = {v[0]: k for k, v in DTYPE_MAP.items()}
-
-        def __init__(self, parent, source_path=None, output_path=None, metadata=None, options=None, tensors_dict=None):
-            self.parent = parent
-            self.source_path = Path(source_path) if source_path else None
-            self.tensors_dict = tensors_dict  # NEW: optional in-memory dict source
-            self.output_path = Path(output_path)
-            self.metadata = metadata
-            self.options = options
-            self.header = None
-            self.offsets = None
-            self.total_parameters = 0
-            self.component_counts = {"vae": 0, "unet": 0, "te": 0, "clip": 0, "other": 0}
-            self.parameter_counts = {"vae": 0, "unet": 0, "te": 0, "clip": 0, "other": 0}
-            self.stripped_counts = {"vae": 0, "te": 0, "clip": 0}
-            self.architecture = "Unknown"
-            self.svd_info = {"svd_applied": False, "compressed_layers": 0, "skipped_layers": 0, "total_original_params": 0, "total_compressed_params": 0, "size_saved_mb": 0.0}
-
-        def _init_accumulators(self):
-            """Reset all per-survey accumulator state."""
-            self.total_parameters = 0
-            self.component_counts = {"vae": 0, "unet": 0, "te": 0, "clip": 0, "other": 0}
-            self.parameter_counts = {"vae": 0, "unet": 0, "te": 0, "clip": 0, "other": 0}
-            self.stripped_counts = {"vae": 0, "te": 0, "clip": 0}
-            self.architecture = "Unknown"
-            self.svd_info = {"svd_applied": False, "compressed_layers": 0, "skipped_layers": 0, "total_original_params": 0, "total_compressed_params": 0, "size_saved_mb": 0.0}
-
-        def _compute_output_dtype_str(self, original_dtype_str, precision, device, target_dtype_str):
-            """Determine the output dtype string for a tensor based on precision settings.
-            
-            Preserves integer dtypes; converts float tensors based on precision/device config.
-            """
-            if original_dtype_str.startswith('I') or original_dtype_str.startswith('U'):
-                return original_dtype_str
-            if precision == 'auto' and device == 'auto':
-                return original_dtype_str
-            return target_dtype_str
-
-        def _finalize_header_and_store(self, tensor_list):
-            """Build header JSON from tensor_list, compute offsets with padding iteration,
-            store results in self, and return (header_dict, total_parameters, component_counts).
-
-            Shared by file-based survey() and dict-based _survey_from_dict() — eliminates
-            the ~140-line code duplication risk flagged in the Phase 2 plan.
-            """
-            # Build placeholder header with dummy offsets (0)
-            header = {}
-            for item in tensor_list:
-                header[item['new_key']] = {
-                    "dtype": item['dtype'],
-                    "shape": list(item['shape']),
-                    "data_offsets": [0, item['size']]  # placeholder
-                }
-            # Add metadata
-            if self.metadata:
-                header['__metadata__'] = self.metadata
-
-            # Compute header length and padding iteratively until stable
-            MAX_ITER = 5
-            for iteration in range(MAX_ITER):
-                header_json = json.dumps(header, separators=(',', ':'))
-                header_len = len(header_json)
-                pad_len = (8 - (header_len % 8)) % 8
-                header_len_padded = header_len + pad_len
-                data_start = 8 + header_len_padded
-
-                # Update header with correct data_offsets relative to data_start
-                for item in tensor_list:
-                    rel_start = item['offset']
-                    rel_end = rel_start + item['size']
-                    header[item['new_key']]['data_offsets'] = [rel_start, rel_end]
-
-                # Recompute header JSON with updated offsets
-                header_json = json.dumps(header, separators=(',', ':'))
-                # Validate JSON
-                try:
-                    json.loads(header_json)
-                except json.JSONDecodeError as e:
-                    raise RuntimeError(f"Generated header JSON is invalid: {e}")
-                new_header_len = len(header_json)
-                new_pad_len = (8 - (new_header_len % 8)) % 8
-                new_header_len_padded = new_header_len + new_pad_len
-
-                if new_header_len_padded == header_len_padded:
-                    # Converged
-                    break
-                # Adjust header_len_padded for next iteration (relative offsets unchanged)
-                header_len_padded = new_header_len_padded
-            else:
-                # Loop completed without convergence (should be rare)
-                print(f"Warning: Header length did not converge after {MAX_ITER} iterations")
-
-            # Now compute absolute offsets
-            for item in tensor_list:
-                item['offset'] += data_start
-
-            # Final header JSON with padding
-            header_json_padded = header_json + ' ' * pad_len
-
-            # Store results
-            self.header = header
-            self.header_json = header_json_padded
-            self.header_len_padded = header_len_padded
-            self.data_start = data_start
-            if tensor_list:
-                first = tensor_list[0]
-                print(f"[DEBUG] data_start = {data_start} (alignment {data_start % 8})")
-                print(f"[DEBUG] first tensor '{first['new_key']}' offset = {first['offset']} (absolute), size = {first['size']}, dtype = {first['dtype']}")
-            self.tensor_list = tensor_list
-
-            return header, self.total_parameters, self.component_counts
-
-        def _build_tensor_list_from_entries(self, tensor_entries, precision, device, target_dtype_str,
-                                             strip_vae, strip_te, strip_clip):
-            """Build sorted tensor_list with offsets from an iterable of tensor metadata entries.
-
-            Args:
-                tensor_entries: iterable of (key, shape_tuple, dtype_str, numel)
-                (other params): same as survey() options
-
-            Returns:
-                List of tensor item dicts with original_key, new_key, shape, dtype, size, offset, pad_after.
-
-            Shared helper used by both file-based survey() and dict-based _survey_from_dict().
-            """
-            tensor_list = []
-            total_data_size = 0
-
-            for key, shape, original_dtype_str, numel in sorted(tensor_entries, key=lambda x: x[0]):
-                # Component stripping
-                if self.parent._should_strip_key(key, strip_vae, strip_te, strip_clip, self.stripped_counts):
-                    continue
-
-                # No key mapping — always ComfyUI original format
-                new_key = key
-
-                # Determine output dtype
-                output_dtype_str = self._compute_output_dtype_str(
-                    original_dtype_str, precision, device, target_dtype_str
-                )
-                elem_size = self.DTYPE_MAP.get(output_dtype_str, (None, 4))[1]
-
-                tensor_size = numel * elem_size
-                pad_after = (8 - (tensor_size % 8)) % 8
-                padded_size = tensor_size + pad_after
-                offset = total_data_size
-                total_data_size += padded_size
-
-                # Component counting for forensic audit
-                self.parent._categorize_key_component(key, numel, self.component_counts, self.parameter_counts)
-                self.total_parameters += numel
-
-                tensor_list.append({
-                    "original_key": key,
-                    "new_key": new_key,
-                    "shape": shape,
-                    "dtype": output_dtype_str,
-                    "size": tensor_size,
-                    "offset": offset,
-                    "pad_after": pad_after,
-                })
-
-            return tensor_list
-
-        def survey(self):
-            """
-            First pass: compute output shape/dtype, build header with offsets.
-            Returns (header_dict, total_parameters, component_counts)
-            """
-            if self.tensors_dict is not None:
-                return self._survey_from_dict()
-
-            # Read header tensors and metadata
-            tensors, metadata = self._read_header(self.source_path)
-
-            # Detect architecture early (needed for metadata)
-            keys_list = list(tensors.keys())
-            arch_raw = detect_checkpoint_architecture(keys_list)
-            self.architecture = ARCHITECTURE_DISPLAY_MAP.get(arch_raw, "Unknown")
-
-            # Determine final metadata using unified metadata factory
-            mode = "preserve_a" if self.options.get('keep_metadata', True) else "none"
-            extra = self.parent._build_architecture_extra(self.architecture)
-            self.metadata = finalize_metadata(
-                metadata=metadata,
-                mode=mode,
-                component="checkpoint_studio",
-                extra_fields=extra,
-            )
-
-            # Determine target dtype and element size
-            precision = self.options.get('precision', 'auto')
-            device = self.options.get('device', 'auto')
-            target_dtype = DeviceManager.get_dtype(precision, device)
-            target_dtype_str = self.DTYPE_MAP_REVERSE.get(target_dtype, "F32")
-
-            strip_vae = self.options.get('strip_vae', False)
-            strip_te = self.options.get('strip_te', False)
-            strip_clip = self.options.get('strip_clip', False)
-
-            # Reset accumulators
-            self._init_accumulators()
-
-            # Build sorted tensor entries from file header: (key, shape, dtype_str, numel)
-            tensor_entries = []
-            for key in sorted(tensors.keys()):
-                info = tensors[key]
-                shape = tuple(info['shape'])
-                dtype_str = info['dtype']
-                numel = 1
-                for dim in shape:
-                    numel *= dim
-                tensor_entries.append((key, shape, dtype_str, numel))
-
-            # Build tensor list with offsets (shared with dict path)
-            tensor_list = self._build_tensor_list_from_entries(
-                tensor_entries, precision, device, target_dtype_str,
-                strip_vae, strip_te, strip_clip
-            )
-
-            # Build header from tensor list (shared with dict path)
-            return self._finalize_header_and_store(tensor_list)
-
-        def _survey_from_dict(self):
-            """
-            Dict-source survey: build header from in-memory tensor dict metadata.
-            No tensor data is materialized — only .shape, .dtype, .numel() are accessed.
-            Metadata is finalized via the unified factory (same as file-based survey).
-            """
-            tensors = self.tensors_dict
-
-            # Detect architecture early (needed for metadata)
-            keys_list = list(tensors.keys())
-            arch_raw = detect_checkpoint_architecture(keys_list)
-            self.architecture = ARCHITECTURE_DISPLAY_MAP.get(arch_raw, "Unknown")
-
-            # Finalize metadata using unified factory (same as file-based survey)
-            mode = "preserve_a" if self.options.get('keep_metadata', True) else "none"
-            extra = self.parent._build_architecture_extra(self.architecture)
-            self.metadata = finalize_metadata(
-                metadata=self.metadata if self.metadata else {},
-                mode=mode,
-                component="checkpoint_studio",
-                extra_fields=extra,
-            )
-
-            precision = self.options.get('precision', 'auto')
-            device = self.options.get('device', 'auto')
-            target_dtype = DeviceManager.get_dtype(precision, device)
-            target_dtype_str = self.DTYPE_MAP_REVERSE.get(target_dtype, "F32")
-
-            strip_vae = self.options.get('strip_vae', False)
-            strip_te = self.options.get('strip_te', False)
-            strip_clip = self.options.get('strip_clip', False)
-
-            # Reset accumulators
-            self._init_accumulators()
-
-            # Build sorted tensor entries from dict: (key, shape, dtype_str, numel)
-            # Access .shape, .dtype, .numel() — metadata only, no tensor data materialization
-            tensor_entries = []
-            for key in sorted(tensors.keys()):
-                tensor = tensors[key]
-                shape = tuple(tensor.shape)
-                # Map torch dtype to safetensors dtype string
-                original_dtype_str = self.DTYPE_MAP_REVERSE.get(tensor.dtype, "F32")
-                numel = tensor.numel()
-                tensor_entries.append((key, shape, original_dtype_str, numel))
-
-            # Build tensor list with offsets (shared with file path)
-            tensor_list = self._build_tensor_list_from_entries(
-                tensor_entries, precision, device, target_dtype_str,
-                strip_vae, strip_te, strip_clip
-            )
-
-            # Build header from tensor list (shared with file path)
-            return self._finalize_header_and_store(tensor_list)
-
-        def weave(self):
-            """
-            Second pass: load, process, write tensors sequentially.
-            """
-            # Ensure survey has been called
-            if not hasattr(self, 'header_json'):
-                raise RuntimeError('Survey must be called before weave')
-
-            if self.tensors_dict is not None:
-                return self._weave_from_dict()
-
-            # Open source file for reading tensors one by one
-            source_path_str = str(self.source_path)
-
-            # Open output file for writing
-            with open(self.output_path, 'wb', buffering=0) as out_f:
-                # Write header length (8 bytes little‑endian)
-                header_len = self.header_len_padded
-                out_f.write(header_len.to_bytes(8, 'little'))
-                # Write header JSON (with padding)
-                out_f.write(self.header_json.encode('utf-8'))
-
-                # Open source safetensors file for reading
-                with safe_open(source_path_str, framework='pt') as sf:
-                    # Iterate over tensors in the same order as survey
-                    for item in self.tensor_list:
-                        original_key = item['original_key']
-                        new_key = item['new_key']
-                        offset = item['offset']
-                        dtype_str = item['dtype']
-
-                        # Load tensor (only this tensor)
-                        tensor = sf.get_tensor(original_key)
-
-                        # Determine target dtype based on stored dtype_str (preserves integer dtypes)
-                        target_torch_dtype = self.DTYPE_MAP.get(dtype_str, (torch.float32, None))[0]
-                        if tensor.dtype != target_torch_dtype:
-                            tensor = tensor.to(dtype=target_torch_dtype)
-                        # Move to target device if needed (with VRAM guard)
-                        target_device = DeviceManager.get_device(self.options.get('device', 'auto'))
-                        if tensor.device != target_device:
-                            if target_device.type != "cpu":
-                                free_vram = DeviceManager.get_free_vram(target_device)
-                                if free_vram is not None:
-                                    tensor_bytes = tensor.numel() * tensor.element_size()
-                                    needed_bytes = tensor_bytes * 3
-                                    if free_vram < needed_bytes:
-                                        short_key = original_key[-48:]
-                                        print(f"         ⚠️  VRAM guard: keeping [{short_key}] on CPU "
-                                              f"(need {needed_bytes / (1024**2):.0f} MB, "
-                                              f"free {free_vram / (1024**2):.0f} MB)")
-                                        target_device = torch.device("cpu")
-                            tensor = tensor.to(device=target_device)
-
-                        # Apply SVD compression if requested
-                        svd_mode = self.options.get('svd_mode', 'none')
-                        if svd_mode != 'none':
-                            svd_tensors, svd_info = self.parent._apply_svd_to_checkpoint(
-                                {new_key: tensor}, svd_mode,
-                                self.options.get('svd_energy_threshold', 0.95)
-                            )
-                            tensor = svd_tensors[new_key]
-                            self.svd_info['svd_applied'] = self.svd_info['svd_applied'] or svd_info['svd_applied']
-                            self.svd_info['compressed_layers'] += svd_info['compressed_layers']
-                            self.svd_info['skipped_layers'] += svd_info['skipped_layers']
-                            self.svd_info['total_original_params'] += svd_info['total_original_params']
-                            self.svd_info['total_compressed_params'] += svd_info['total_compressed_params']
-                            self.svd_info['size_saved_mb'] += svd_info['size_saved_mb']
-
-                        # Ensure tensor is contiguous and on CPU for writing
-                        if not tensor.is_contiguous():
-                            tensor = tensor.contiguous()
-                        tensor_cpu = tensor.cpu()
-
-                        # Write tensor bytes at the pre‑calculated offset
-                        current_pos = out_f.tell()
-                        if current_pos < offset:
-                            padding = offset - current_pos
-                            if padding > 0:
-                                print(f"[DEBUG PADDING] Writing {padding} zero bytes before tensor {new_key}")
-                                out_f.write(b'\x00' * padding)
-                        elif current_pos > offset:
-                            print(f"[WARNING] File position {current_pos} ahead of offset {offset}, seeking back")
-                            out_f.seek(offset)
-                        arr = tensor_cpu.numpy()
-                        out_f.write(arr.tobytes())
-                        pad_after = item.get('pad_after', 0)
-                        if pad_after:
-                            out_f.write(b'\x00' * pad_after)
-                        tensor_size = arr.nbytes
-                        print(f"[DEBUG PADDING] tensor {new_key} size {tensor_size}")
-                        out_f.flush()
-
-                        del tensor, tensor_cpu, arr
-                        cleanup_memory()
-
-                    out_f.flush()
-                    os.fsync(out_f.fileno())
-                    self._validate_safetensors_file(self.output_path)
-
-            print(f"✅ Stream writing completed: {self.output_path}")
-
-        def _weave_from_dict(self):
-            """
-            Dict-source weave: read tensors from in-memory dict instead of safe_open,
-            process (dtype/device/SVD), write sequentially, then `del` the original
-            key from the dict to best-effort free memory during iteration.
-            """
-            if not hasattr(self, 'header_json'):
-                raise RuntimeError('Survey must be called before weave')
-
-            with open(self.output_path, 'wb', buffering=0) as out_f:
-                # Write header (same as file-based weave)
-                out_f.write(self.header_len_padded.to_bytes(8, 'little'))
-                out_f.write(self.header_json.encode('utf-8'))
-
-                for item in self.tensor_list:
-                    original_key = item['original_key']
-                    new_key = item['new_key']
-                    offset = item['offset']
-                    dtype_str = item['dtype']
-
-                    # Read tensor from in-memory dict
-                    tensor = self.tensors_dict[original_key]
-
-                    # Dtype/device conversion (same logic as file-based weave)
-                    target_torch_dtype = self.DTYPE_MAP.get(dtype_str, (torch.float32, None))[0]
-                    if tensor.dtype != target_torch_dtype:
-                        tensor = tensor.to(dtype=target_torch_dtype)
-                    target_device = DeviceManager.get_device(self.options.get('device', 'auto'))
-                    if tensor.device != target_device:
-                        if target_device.type != "cpu":
-                            free_vram = DeviceManager.get_free_vram(target_device)
-                            if free_vram is not None:
-                                tensor_bytes = tensor.numel() * tensor.element_size()
-                                needed_bytes = tensor_bytes * 3
-                                if free_vram < needed_bytes:
-                                    short_key = original_key[-48:]
-                                    print(f"         ⚠️  VRAM guard: keeping [{short_key}] on CPU "
-                                          f"(need {needed_bytes / (1024**2):.0f} MB, "
-                                          f"free {free_vram / (1024**2):.0f} MB)")
-                                    target_device = torch.device("cpu")
-                        tensor = tensor.to(device=target_device)
-
-                    # SVD (same logic as file-based weave)
-                    svd_mode = self.options.get('svd_mode', 'none')
-                    if svd_mode != 'none':
-                        svd_tensors, svd_info = self.parent._apply_svd_to_checkpoint(
-                            {new_key: tensor}, svd_mode,
-                            self.options.get('svd_energy_threshold', 0.95)
-                        )
-                        tensor = svd_tensors[new_key]
-                        self.svd_info['svd_applied'] = self.svd_info['svd_applied'] or svd_info['svd_applied']
-                        self.svd_info['compressed_layers'] += svd_info['compressed_layers']
-                        self.svd_info['skipped_layers'] += svd_info['skipped_layers']
-                        self.svd_info['total_original_params'] += svd_info['total_original_params']
-                        self.svd_info['total_compressed_params'] += svd_info['total_compressed_params']
-                        self.svd_info['size_saved_mb'] += svd_info['size_saved_mb']
-
-                    # Ensure tensor is contiguous and on CPU for writing
-                    if not tensor.is_contiguous():
-                        tensor = tensor.contiguous()
-                    tensor_cpu = tensor.cpu()
-
-                    # Write at pre-calculated offset
-                    current_pos = out_f.tell()
-                    if current_pos < offset:
-                        padding = offset - current_pos
-                        if padding > 0:
-                            out_f.write(b'\x00' * padding)
-                    elif current_pos > offset:
-                        out_f.seek(offset)
-                    arr = tensor_cpu.numpy()
-                    out_f.write(arr.tobytes())
-                    pad_after = item.get('pad_after', 0)
-                    if pad_after:
-                        out_f.write(b'\x00' * pad_after)
-                    out_f.flush()
-
-                    # Best-effort: delete original key from dict to free memory during iteration
-                    # (Finding 13 — incremental memory reduction during weave)
-                    if original_key in self.tensors_dict:
-                        del self.tensors_dict[original_key]
-
-                    del tensor, tensor_cpu, arr
-                    cleanup_memory()
-
-                out_f.flush()
-                os.fsync(out_f.fileno())
-                self._validate_safetensors_file(self.output_path)
-
-            print(f"✅ Dict stream writing completed: {self.output_path}")
-
-        def _validate_safetensors_file(self, filepath):
-            """
-            Validate the safetensors file after writing:
-            - Read header length and ensure it matches the computed length.
-            - Parse JSON header and ensure it's valid.
-            - Verify that each tensor's data_offsets are within file bounds.
-            - Verify 8‑byte alignment of each tensor offset.
-            """
-            with open(filepath, 'rb') as f:
-                # Read header length
-                header_len_bytes = f.read(8)
-                if len(header_len_bytes) != 8:
-                    raise RuntimeError(f"File too short: {filepath}")
-                header_len = int.from_bytes(header_len_bytes, 'little')
-                # Read header JSON
-                header_json_bytes = f.read(header_len)
-                if len(header_json_bytes) != header_len:
-                    raise RuntimeError(f"Header length mismatch: expected {header_len}, got {len(header_json_bytes)}")
-                # Decode and parse JSON
-                try:
-                    header = json.loads(header_json_bytes.decode('utf-8'))
-                except json.JSONDecodeError as e:
-                    raise RuntimeError(f"Invalid JSON in header: {e}")
-                # Ensure header is a dict
-                if not isinstance(header, dict):
-                    raise RuntimeError("Header is not a JSON object")
-                # Remove __metadata__ if present (it's not a tensor)
-                tensor_headers = {k: v for k, v in header.items() if k != '__metadata__'}
-                # Compute data start offset
-                data_start = 8 + header_len
-                # Get file size
-                f.seek(0, 2)  # seek to end
-                file_size = f.tell()
-                for key, info in tensor_headers.items():
-                    if 'data_offsets' not in info:
-                        raise RuntimeError(f"Tensor {key} missing data_offsets")
-                    start, end = info['data_offsets']
-                    # Verify offsets are relative to data_start
-                    absolute_start = data_start + start
-                    absolute_end = data_start + end
-                    if absolute_start < data_start:
-                        raise RuntimeError(f"Tensor {key} start offset is negative relative")
-                    if absolute_end > file_size:
-                        raise RuntimeError(f"Tensor {key} ends beyond file size: {absolute_end} > {file_size}")
-                    # Verify 8‑byte alignment (warning only, source checkpoints may be misaligned)
-                    if absolute_start % 8 != 0:
-                        print(f"[WARNING] Tensor {key} start offset not 8‑byte aligned: {absolute_start}")
-                # Success
-                return True
-
     class _LazyCheckpointMapping:
         """
         A dict‑like wrapper that loads tensors from a safetensors file on demand.
+
+        WHY THIS EXISTS (instead of using safe_open):
+            safetensors.safe_open() uses mmap internally to map the entire file into
+            memory. While individual tensors are only loaded on first access (lazy
+            page faults), the mmap pages remain resident in RAM and cannot be reliably
+            freed between batches. This causes cumulative RAM growth in workflows that
+            create and destroy multiple lazy mappings (e.g., checkpoint baker with
+            per-batch source reopening, or checkpoint weaver with batched merging).
+
+            There is no safe_open API to force-release mmap pages. Closing the safe_open
+            handle and deleting the object does NOT guarantee the OS will reclaim the
+            pages. Over many batches, this leads to OOM.
+
+        HOW THIS WORKS INSTEAD:
+            1. Opens the file with built-in open() in binary mode (no mmap)
+            2. On first access, manually parses the safetensors header (magic bytes,
+               header length, JSON metadata) — ~50 KB read, negligible cost
+            3. On __getitem__, seeks to the absolute data offset and reads the exact
+               byte range for the requested tensor, then reconstructs a torch.Tensor
+               from the bytes via torch.frombuffer
+            4. Exposes close() that actually closes the binary file handle — no mmap
+               pages to leak
+            5. Re-opening after close re-reads the header (cheap, ~50 KB)
+
+        LIMITATIONS:
+            - This is NOT a general replacement for safe_open. It's optimized for
+              sequential, per-tensor access patterns (baking, merging, conversion).
+            - Full tensor data is read into memory on each access (same as safe_open
+              get_tensor). For random-access patterns across very large files, mmap
+              may be more efficient.
+            - Thread safety: None (same as safe_open).
+
+        Supports write-through via _write_cache for keys that are set (not from file),
+        enabling compatibility with code that writes to the mapping (e.g. ComfyUI's
+        model loader during temp fallback, or _assemble_output_lazy which overlays
+        baked keys).
         """
         _sentinel = object()
-        def __init__(self, filepath, metadata=None):
+
+        # Safetensors dtype string → torch.dtype mapping
+        # NOTE: Imported from key_utils to eliminate fragile cross-module coupling.
+        # 'F8' is included for backward compatibility with files created by older
+        # versions of this node that used the wrong dtype string.
+        # The correct identifier per safetensors spec is 'F8_E4M3'.
+        from ..engine.key_utils import SAFETENSORS_DTYPE_MAP as _SAFETENSORS_DTYPE_MAP
+
+        def __init__(self, filepath, metadata=None, target_dtype=None):
             self.filepath = Path(filepath)
             self.metadata = metadata or {}
-            self._handle = None
-            self._keys = None
+            self._handle = None          # binary file handle (not safe_open)
+            self._header = None          # parsed tensor headers: {name: {dtype, shape, data_offsets}}
+            self._keys = None            # list of tensor keys (preserves file order)
+            self._metadata_from_file = {}  # metadata from safetensors file header
+            self._data_start = 0         # absolute byte offset where tensor data begins
             self._popped = set()
-        
+            self._write_cache: Optional[Dict[str, torch.Tensor]] = None
+            self._target_dtype = target_dtype  # Optional uniform dtype conversion (Fix FP8)
+            self._permanent_closed = False  # SSD Fix: prevents auto-reopen after permanent close
+
+        @staticmethod
+        def _is_companion_scale_key(key: str) -> bool:
+            """Check if a key is a FP8 companion scale (weight_scale or input_scale).
+
+            Companion scales are stored alongside FP8 weight tensors for
+            per-channel dequantization. They must remain accessible via
+            __getitem__ (for _load_fp8_scale) but must NOT appear in iteration
+            methods (__iter__, keys, items, values, __len__) to prevent leaking
+            as unrecognized model weights ("unet unexpected" keys in ComfyUI).
+            """
+            return key.endswith(('.weight_scale', '.input_scale'))
+
         def _ensure_open(self):
-            if self._handle is None:
-                self._handle = safe_open(str(self.filepath), framework='pt')
-        
+            """
+            Open the safetensors file in binary mode and parse the header.
+
+            NOTE: We intentionally do NOT use safetensors.safe_open() here because
+            its mmap-based implementation cannot release pages between batches.
+            See class docstring for full rationale.
+            """
+            # SSD Fix: prevent auto-reopen after permanent_close()
+            if self._permanent_closed:
+                raise RuntimeError(
+                    f"Cannot reopen permanently closed mapping: {self.filepath}. "
+                    "This mapping was closed after model loading completed."
+                )
+            if self._handle is not None:
+                return
+            # Open in binary mode — no mmap
+            self._handle = open(self.filepath, 'rb')
+            # Read header length (8 bytes, little-endian uint64)
+            header_len_bytes = self._handle.read(8)
+            if len(header_len_bytes) < 8:
+                raise ValueError(f"File too small or invalid safetensors: {self.filepath}")
+            header_len = int.from_bytes(header_len_bytes, 'little')
+            # Read and parse JSON header
+            header_bytes = self._handle.read(header_len)
+            if len(header_bytes) < header_len:
+                raise ValueError(f"Truncated header in safetensors file: {self.filepath}")
+            header = json.loads(header_bytes)
+            # Extract file metadata
+            self._metadata_from_file = header.get('__metadata__', {})
+            # Store tensor headers only (preserves file insertion order via Python 3.7+ dict)
+            self._header = {k: v for k, v in header.items() if k != '__metadata__'}
+            self._keys = list(self._header.keys())
+            # Data starts after the 8-byte length prefix + header payload
+            self._data_start = 8 + header_len
+
         def __getitem__(self, key):
+            # Check write cache first (keys set via __setitem__)
+            if self._write_cache and key in self._write_cache:
+                return self._apply_target_dtype(self._write_cache[key], key)
             self._ensure_open()
-            try:
-                return self._handle.get_tensor(key)
-            except Exception as e:
-                raise KeyError(f"Key {key} not found in {self.filepath}") from e
-        
+            if key not in self._header:
+                raise KeyError(f"Key {key} not found in {self.filepath}")
+            info = self._header[key]
+            dtype_str = info['dtype']
+            shape = info['shape']
+            start, end = info['data_offsets']
+            # Seek to the absolute data offset
+            absolute_offset = self._data_start + start
+            tensor_size = end - start
+            self._handle.seek(absolute_offset)
+            tensor_bytes = self._handle.read(tensor_size)
+            dtype = self._SAFETENSORS_DTYPE_MAP[dtype_str]
+            # Use bytearray for writable buffer compatibility across PyTorch versions
+            tensor = torch.frombuffer(bytearray(tensor_bytes), dtype=dtype).reshape(shape)
+            return self._apply_target_dtype(tensor, key)
+
+        def _apply_target_dtype(self, tensor: torch.Tensor, key: str) -> torch.Tensor:
+            """
+            Apply uniform dtype conversion to a tensor, handling FP8 dequantization.
+
+            When target_dtype is set and the tensor is FP8, this:
+              1. Casts FP8 → target dtype (e.g. bf16) — giving scaled values
+              2. Loads the per-channel scale factor from the companion
+                 .weight_scale / .input_scale tensor
+              3. Multiplies: tensor_out = tensor_fp8_as_bf16 * scale
+
+            For non-FP8 dtypes, performs a simple cast.
+
+            Returns the original tensor unchanged if target_dtype is None
+            or the tensor already matches target_dtype.
+            """
+            if self._target_dtype is None or tensor.dtype == self._target_dtype:
+                return tensor
+            if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                # Dequantize FP8→target_dtype using companion scale factors
+                # Pass self as scale_store (supports __contains__ for write cache + file)
+                tensor = dequant_fp8_tensor(tensor, key, self._target_dtype, self)
+            elif tensor.dtype == torch.int8:
+                # Dequantize INT8→target_dtype using companion .weight_scale factor
+                # Same pattern as FP8: pass self as scale_store for lazy file-backed lookup
+                tensor = dequant_int8_tensor(tensor, key, self._target_dtype, self)
+            else:
+                tensor = tensor.to(dtype=self._target_dtype)
+            return tensor
+
+        def _load_fp8_scale(self, key: str) -> Optional[torch.Tensor]:
+            """
+            Load the per-channel scale factor for an fp8 weight tensor.
+
+            FP8 checkpoints store weights with per-channel quantization:
+              weight key:     double_blocks.0.img_attn.proj.weight    (fp8_e4m3fn)
+              weight_scale:   double_blocks.0.img_attn.proj.weight_scale  (float32)
+              input_scale:    double_blocks.0.img_attn.proj.input_scale   (float32)
+
+            The scale factor is a 1-D tensor [out_channels] that must be
+            multiplied element-wise after the fp8→bf16 cast to recover the
+            original weight values.
+
+            Returns None for keys that are not per-channel-quantized weights
+            (biases, norms, non-diffusion keys, or scale keys themselves).
+            """
+            # Scale keys are not weights — no self-referential lookup
+            if key.endswith(('.weight_scale', '.input_scale')):
+                return None
+
+            # Derive the base prefix by stripping trailing .weight or .bias
+            if key.endswith('.weight'):
+                prefix = key[:-len('.weight')]
+            elif key.endswith('.bias'):
+                prefix = key[:-len('.bias')]
+            else:
+                return None
+
+            # Check write cache first — companion scales stored by baking processor
+            # (e.g. _assemble_output_lazy in baking_processor_baking.py) live in the
+            # write cache, not the underlying file. Without this check, dequantization
+            # of write-cache-backed FP8 tensors silently skips the scale factor,
+            # producing noise.
+            if self._write_cache:
+                for suffix in ('.weight_scale', '.input_scale'):
+                    scale_key = prefix + suffix
+                    if scale_key in self._write_cache:
+                        return self._write_cache[scale_key]
+
+            self._ensure_open()
+
+            # Try weight_scale first (primary per-channel scale), then input_scale
+            for suffix in ('.weight_scale', '.input_scale'):
+                scale_key = prefix + suffix
+                if scale_key in self._header:
+                    info = self._header[scale_key]
+                    dtype_str = info['dtype']
+                    shape = info['shape']
+                    start, end = info['data_offsets']
+                    offset = self._data_start + start
+                    self._handle.seek(offset)
+                    raw = self._handle.read(end - start)
+                    dtype = self._SAFETENSORS_DTYPE_MAP[dtype_str]
+                    return torch.frombuffer(bytearray(raw), dtype=dtype).reshape(shape)
+
+            return None
+
+        def __setitem__(self, key, value):
+            """Store a tensor in the write cache (does not modify the underlying file)."""
+            if self._write_cache is None:
+                self._write_cache = {}
+            self._write_cache[key] = value
+
         def __iter__(self):
+            """Iterate keys — includes .weight_scale for MixedPrecisionOps when _user_fp8_mode."""
             self._ensure_open()
-            return iter([k for k in self._handle.keys() if k not in self._popped])
-        
+            user_fp8 = getattr(self, '_user_fp8_mode', False)
+            for k in self._iter_keys_unfiltered():
+                if user_fp8 and k.endswith('.weight_scale'):
+                    yield k  # MixedPrecisionOps needs these for FP8 dequant
+                elif not self._is_companion_scale_key(k):
+                    yield k
+
+        def _iter_keys_unfiltered(self):
+            """Generator: all keys (write cache + file), respecting popped status.
+
+            Used by items() and __len__() which MUST include companion scales
+            for downstream materialization (baker_node.py:465 uses dict(items())).
+            """
+            cached = list(self._write_cache.keys()) if self._write_cache else []
+            for k in cached:
+                yield k
+            for k in self._keys:
+                if k not in self._popped and k not in cached:
+                    yield k
+
         def __len__(self):
             self._ensure_open()
-            return len([k for k in self._handle.keys() if k not in self._popped])
+            return sum(1 for _ in self._iter_keys_unfiltered())
+
         def keys(self):
+            """Return list of keys — includes .weight_scale for MixedPrecisionOps when _user_fp8_mode."""
             self._ensure_open()
-            return [k for k in self._handle.keys() if k not in self._popped]
+            user_fp8 = getattr(self, '_user_fp8_mode', False)
+            return [k for k in self._iter_keys_unfiltered()
+                    if (user_fp8 and k.endswith('.weight_scale'))
+                    or not self._is_companion_scale_key(k)]
 
         def items(self):
-            """Iterate over (key, tensor) pairs, skipping popped keys."""
+            """Iterate (key, tensor) pairs — INCLUDES companion scales (needed by baker materialization).
+
+            NOTE: Companion scales ARE included here because baker_node.py:465
+            uses ``dict(output_sd.items())`` to materialize a _LazyCheckpointMapping
+            to file, and the saved file MUST contain companion scales for subsequent
+            FP8→BF16 dequantization via _LazyCheckpointMapping.
+            """
             self._ensure_open()
-            for k in self._handle.keys():
-                if k not in self._popped:
-                    yield k, self._handle.get_tensor(k)
+            for k in self._iter_keys_unfiltered():
+                yield k, self.__getitem__(k)
 
         def values(self):
-            """Iterate over tensors, skipping popped keys."""
+            """Iterate tensors — INCLUDES companion scales (via items())."""
             for _, v in self.items():
                 yield v
 
         def __contains__(self, key):
+            if self._write_cache and key in self._write_cache:
+                return True
             self._ensure_open()
-            return key in self._handle.keys() and key not in self._popped
+            return key in self._header and key not in self._popped
+
+        def update(self, other: Dict[str, torch.Tensor]) -> None:
+            """Batch-update write cache from another dict."""
+            if self._write_cache is None:
+                self._write_cache = {}
+            self._write_cache.update(other)
 
         # NOTE: Kept for dict protocol compatibility — downstream code
         # (e.g. comfy.sd.load_state_dict_guess_config) may call .get().
@@ -915,157 +717,64 @@ class MusubiCheckpointStudio:
             if default is not self._sentinel:
                 return default
             raise KeyError(key)
-        
-        
+
         def close(self):
+            """
+            Release the binary file handle.
+
+            Unlike safe_open.close(), this actually releases the file descriptor.
+            After close(), the file can be reopened by the next __getitem__ call
+            (header is re-read from disk — cheap at ~50 KB).
+
+            Call this between batches to prevent RAM accumulation from mmap pages.
+
+            NOTE: This is a TEMPORARY close — the file handle will be reopened
+            automatically on the next __getitem__ access. For a permanent close
+            that prevents reopening, call permanent_close() instead.
+            """
             if self._handle is not None:
-                if hasattr(self._handle, 'close'):
-                    self._handle.close()
+                self._handle.close()
                 self._handle = None
-        
+            # Header stays cached — keys() etc. still work after close.
+            # Re-opening will re-parse the header (~50 KB, cheap).
+
+        def permanent_close(self):
+            """
+            Permanently close the file handle and prevent all future reopening.
+
+            Unlike close(), which allows the file to be reopened on the next access,
+            permanent_close() sets a flag that causes _ensure_open() to raise an error.
+            This prevents file handles from leaking after the mapping is no longer needed.
+
+            Call this after model objects have been fully loaded from the mapping.
+            Any subsequent __getitem__ attempts will raise RuntimeError.
+            """
+            self._permanent_closed = True
+            self.close()
+
         def __enter__(self):
             return self
-        
+
         def __exit__(self, *args):
             self.close()
-        
+
         def __del__(self):
-            self.close()
+            # SSD Fix: Use permanent close in __del__ to prevent auto-reopen
+            # if GC triggers __del__ while the mapping is temporarily closed.
+            self.permanent_close()
 
-    def _apply_svd_to_checkpoint(self, tensors, svd_mode, energy_threshold,
-                                  target_device: Optional[torch.device] = None):
-        """
-        Apply SVD compression to weight tensors in the checkpoint.
-        Returns (compressed_tensors, compression_info)
+        def copy(self):
+            """Return a real dict with all tensors materialized, companion scales EXCLUDED.
 
-        When ``target_device`` is provided and is CUDA, each tensor is moved
-        one-at-a-time to GPU for accelerated SVD, then moved back to CPU before
-        processing the next tensor. This avoids loading all checkpoint weights
-        onto GPU simultaneously (key VRAM optimization). A VRAM guard checks
-        that sufficient free memory exists before each GPU SVD.
-        """
-        if svd_mode == "none":
-            return tensors, {"svd_applied": False, "compressed_layers": 0}
-        
-        total_original_params = 0
-        total_compressed_params = 0
-        compressed_layers = 0
-        skipped_layers = 0
-        
-        # Minimum dimension threshold for SVD (skip tiny matrices)
-        SVD_MIN_DIM = 128
-        
-        for key, tensor in tensors.items():
-            # Decide if tensor is a weight matrix suitable for SVD
-            is_weight = key.endswith('.weight') and tensor.ndim == 2
-            if not is_weight:
-                # Keep original tensor (no change)
-                continue
-            
-            out_features, in_features = tensor.shape
-            
-            # Heuristic for selective mode: only compress large matrices
-            if svd_mode == "selective" and (out_features <= 1024 or in_features <= 1024):
-                skipped_layers += 1
-                continue
-            
-            # Global shape guard: skip tiny matrices regardless of mode
-            if out_features < SVD_MIN_DIM and in_features < SVD_MIN_DIM:
-                skipped_layers += 1
-                continue
-            
-            # Determine if rank would be full rank (no compression benefit)
-            min_dim = min(out_features, in_features)
-            # For selective/full mode we'll compute rank later, but we can still skip if min_dim == 1
-            if min_dim == 1:
-                skipped_layers += 1
-                continue
-            
-            # Keep tensor on its current device, convert to float32 for SVD
-            orig_device = tensor.device
-            orig_dtype = tensor.dtype
-            tensor_fp32 = tensor.float()  # same device initially
-            
-            # ── VRAM-aware per-tensor GPU SVD ─────────────────────────────────
-            # Move ONE tensor to GPU for SVD, then move result back to CPU
-            # before processing the next tensor. This avoids loading all
-            # checkpoint weights onto GPU simultaneously.
-            moved_to_gpu_for_svd = False
-            if target_device is not None and target_device.type != "cpu":
-                free_vram = DeviceManager.get_free_vram(target_device)
-                tensor_bytes = tensor_fp32.numel() * tensor_fp32.element_size()
-                # SVD needs ~3× tensor size for working memory (U, S, Vh)
-                needed_bytes = tensor_bytes * 3
-                if free_vram is not None and free_vram >= needed_bytes:
-                    if tensor_fp32.device != target_device:
-                        tensor_fp32 = tensor_fp32.to(target_device)
-                        moved_to_gpu_for_svd = True
-                        short_key = key[-48:]
-                        print(f"      ⚡ GPU SVD [{short_key}] "
-                              f"{out_features}×{in_features} | "
-                              f"{tensor_bytes / (1024**2):.1f} MB → "
-                              f"free VRAM {free_vram / (1024**2):.0f} MB")
-                elif free_vram is not None:
-                    short_key = key[-48:]
-                    print(f"      ⚠️ CPU SVD [{short_key}] "
-                          f"({out_features}×{in_features}, "
-                          f"need ≥{needed_bytes / (1024**2):.0f} MB, "
-                          f"free VRAM {free_vram / (1024**2):.0f} MB)")
-            
-            try:
-                U, S, Vh = torch.linalg.svd(tensor_fp32, full_matrices=False)
-            except Exception as e:
-                print(f"[WARNING] SVD failed for {key}: {e}, skipping")
-                skipped_layers += 1
-                continue
-            
-            # Determine target rank
-            total_energy = torch.sum(S ** 2)
-            # auto rank based on energy threshold
-            cumulative = torch.cumsum(S ** 2, dim=0)
-            k = torch.searchsorted(cumulative, energy_threshold * total_energy).item() + 1
-            k = min(k, len(S))
-            # Ensure at least rank 1
-            k = max(k, 1)
-            
-            # Skip if compressed representation would be larger than original
-            original_params = out_features * in_features
-            compressed_params = out_features * k + k * in_features
-            if compressed_params >= original_params:
-                skipped_layers += 1
-                continue
-            
-            # Truncate and reconstruct
-            sqrt_Sk = torch.sqrt(S[:k])
-            reconstructed = (U[:, :k] * sqrt_Sk) @ (sqrt_Sk[:, None] * Vh[:k, :])
-            # Move back to CPU if we accelerated on GPU, then cast to original dtype
-            if moved_to_gpu_for_svd:
-                reconstructed = reconstructed.cpu()
-            reconstructed = reconstructed.to(dtype=orig_dtype)
-            
-            # Replace tensor in-place
-            tensors[key] = reconstructed
-            compressed_layers += 1
-            total_original_params += out_features * in_features
-            total_compressed_params += out_features * k + k * in_features  # low-rank representation size
-            
-            if svd_mode == "selective" or svd_mode == "full":
-                energy_ratio = torch.sum(S[:k]**2) / total_energy
-                print(f"[SVD] compressed {key}: {out_features}x{in_features} -> rank {k} (energy {energy_ratio:.3f})")
-            
-            # Delete intermediate variables to free memory (only for large tensors)
-            if out_features * in_features > 1024 * 1024:  # 1M parameters
-                cleanup_memory(U, S, Vh, sqrt_Sk, tensor_fp32)
-        
-        compression_info = {
-            "svd_applied": compressed_layers > 0,
-            "compressed_layers": compressed_layers,
-            "skipped_layers": skipped_layers,
-            "total_original_params": total_original_params,
-            "total_compressed_params": total_compressed_params,
-            "size_saved_mb": (total_original_params - total_compressed_params) * 4 / (1024 * 1024),
-        }
-        return tensors, compression_info
+            Required for dict protocol compatibility — ComfyUI's
+            ``load_state_dict_guess_config`` may call .copy() on the state dict.
+            Companion scales are stripped from the copy to prevent ``unet unexpected``
+            key warnings during model loading.
+
+            NOTE: This differs from ``dict(self.items())`` which INCLUDES companion
+            scales (needed by baker_node.py materialization to file).
+            """
+            return {k: v for k, v in self.items() if not self._is_companion_scale_key(k)}
 
     def _parse_checkpoint_data(self, checkpoint_data):
         """
@@ -1104,19 +813,26 @@ class MusubiCheckpointStudio:
             metadata = {}
         return state_dict, metadata
 
-    def _estimate_quality_retention(self, target_dtype):
+    def _estimate_quality_retention(self, target_dtype, output_format="safetensors"):
         """
         Rough estimate of quality retention after precision conversion.
         Returns integer percentage or None if unknown.
         """
-        if target_dtype == torch.float32:
+        # GGUF block-wise quant quality estimates
+        if output_format == "gguf_q8_0":
+            return 97  # 8-bit block-wise, very high quality retention
+        elif output_format == "gguf_q5_0":
+            return 94  # 5-bit block-wise, good quality
+        elif output_format == "gguf_q4_0":
+            return 90  # 4-bit block-wise, reasonable quality
+        elif target_dtype == torch.float32:
             return 100
         elif target_dtype == torch.bfloat16:
             return 99
         elif target_dtype == torch.float16:
             return 98
         elif target_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-            return 95
+            return 97  # Selective BF16 preservation protects critical layers/norms
         else:
             return None
 
@@ -1146,7 +862,10 @@ class MusubiCheckpointStudio:
 
         # Architecture detection — centralized via checkpoint_normalizer
         keys_list = list(tensors.keys())
-        arch_raw = detect_checkpoint_architecture(keys_list)
+        if detect_checkpoint_architecture is not None:
+            arch_raw = detect_checkpoint_architecture(keys_list)
+        else:
+            arch_raw = "Unknown"
         architecture = ARCHITECTURE_DISPLAY_MAP.get(arch_raw, "Unknown")
 
         total_size_gb = total_size_bytes / (1024**3)
@@ -1162,7 +881,9 @@ class MusubiCheckpointStudio:
             "parameter_counts": parameter_counts,
         }
 
-    def _generate_forensic_report_from_analysis(self, analysis, processed_tensors, target_dtype, stripped_counts, svd_info=None):
+    def _generate_forensic_report_from_analysis(self, analysis, processed_tensors, target_dtype,
+                                                 stripped_counts, svd_info=None,
+                                                 output_format="safetensors"):
         """
         Generate standardized forensic report from a pre‑computed analysis dict
         (no access to the original tensor dict needed).
@@ -1183,37 +904,22 @@ class MusubiCheckpointStudio:
             target_dtype=target_dtype,
             svd_info=svd_info,
             summary_prefix=summary_prefix,
-        )
-
-    def _generate_forensic_report_from_survey(self, total_parameters, component_counts, parameter_counts, stripped_counts, architecture, target_dtype, svd_info=None):
-        """
-        Generate standardized forensic report using pre‑computed survey metrics (streaming path).
-        """
-        total_tensors = sum(component_counts.values())
-        total_size_gb = total_parameters * 4 / (1024**3)
-        # Size savings based on target dtype
-        size_savings_gb = self._compute_size_savings_gb(total_parameters * 4, total_parameters, target_dtype)
-        return self._format_forensic_report_lines(
-            total_parameters=total_parameters,
-            total_size_gb=total_size_gb,
-            size_savings_gb=size_savings_gb,
-            component_counts=component_counts,
-            stripped_counts=stripped_counts,
-            architecture=architecture,
-            target_dtype=target_dtype,
-            svd_info=svd_info,
-            summary_prefix=f"{total_tensors} tensors",
+            output_format=output_format,
         )
 
     def _format_forensic_report_lines(self, total_parameters, total_size_gb, size_savings_gb,
                                        component_counts, stripped_counts, architecture,
-                                       target_dtype, svd_info=None, summary_prefix=""):
+                                       target_dtype, svd_info=None, summary_prefix="",
+                                       output_format="safetensors"):
         """
         Shared formatting for forensic report lines.
         """
         lines = []
         lines.append("🛡️ --- CHECKPOINT STUDIO: FORENSIC REPORT --- 🛡️")
-        dtype_label = str(target_dtype).split('.')[-1] if target_dtype else 'unknown'
+        if output_format.startswith("gguf_"):
+            dtype_label = output_format.replace("gguf_", "GGUF ").upper()
+        else:
+            dtype_label = str(target_dtype).split('.')[-1] if target_dtype else 'unknown'
         lines.append(f"🎯 PRECISION: {dtype_label}")
         stripped_parts = []
         if stripped_counts['vae'] > 0:
@@ -1236,194 +942,504 @@ class MusubiCheckpointStudio:
         if comp['vae'] > 0 or comp['unet'] > 0 or comp['te'] > 0 or comp['clip'] > 0:
             lines.append(f"🧱 COMPONENTS: VAE {comp['vae']}, UNet {comp['unet']}, TE {comp['te']}, CLIP {comp['clip']}, other {comp['other']}")
         # Quality retention estimate
-        quality_pct = self._estimate_quality_retention(target_dtype)
+        quality_pct = self._estimate_quality_retention(target_dtype, output_format=output_format)
         if quality_pct is not None:
             lines.append(f"✅ ESTIMATED QUALITY: {quality_pct}%")
         if stripped_counts['vae'] > 0 or stripped_counts['te'] > 0 or stripped_counts['clip'] > 0:
             lines.append(f"🗑️ STRIPPED: VAE {stripped_counts['vae']}, TE {stripped_counts['te']}, CLIP {stripped_counts['clip']}")
         if svd_info and svd_info.get('svd_applied'):
-            lines.append(f"🔧 SVD COMPRESSED: {svd_info.get('compressed_layers', 0)} layers, {svd_info.get('size_saved_mb', 0):.2f} MB saved")
+            rank_ratio = svd_info.get('avg_rank_ratio', 0)
+            lines.append(f"🔧 SVD COMPRESSED: {svd_info.get('compressed_layers', 0)} layers "
+                         f"(rank ratio {rank_ratio:.3f})")
         lines.append(f"📅 DATE: {time.strftime('%Y-%m-%d %H:%M:%S')}")
         return "\n".join(lines)
 
-    def _convert_with_streaming(self, source_path, save_trigger, filename, precision, device,
-                                strip_vae, strip_te, strip_clip, save_folder, keep_metadata,
-                                svd_mode, svd_energy_threshold, debug, node_id):
-        """
-        Perform conversion via streaming writer (flat‑RAM guarantee).
-        Returns (checkpoint, output, forensic_report).
-        """
-        start_time = time.time()
-
-        # Determine target device and dtype
-        target_device = DeviceManager.get_device(device)
-        target_dtype = DeviceManager.get_dtype(precision, target_device)
-
-        # Build options dict
-        options = {
-            'precision': precision,
-            'device': device,
-            'strip_vae': strip_vae,
-            'strip_te': strip_te,
-            'strip_clip': strip_clip,
-            'svd_mode': svd_mode,
-            'svd_energy_threshold': svd_energy_threshold,
-            'keep_metadata': keep_metadata,
-        }
-
-        # Determine output path
-        if save_trigger:
-            output_path = self._resolve_output_path(save_folder, filename)
-        else:
-            output_path = get_experiment_temp_path("checkpoint_studio")
-            output_path = output_path.with_suffix('.safetensors')
-            # Register temp file for cleanup (Finding 12 — get_experiment_temp_path
-            # does NOT auto-register; explicit registration required)
-            ThreadSafeCleanup.register_temp_file(output_path)
-
-        # Create streaming writer
-        writer = self._SafetensorsStreamWriter(
-            parent=self,
-            source_path=source_path,
-            output_path=output_path,
-            metadata={},  # will be populated from source metadata
-            options=options,
-        )
-        # First pass: survey
-        header, total_parameters, component_counts = writer.survey()
-        # Metadata already finalized in survey, use writer.metadata
-        final_metadata = writer.metadata
-        # Second pass: weave
-        writer.weave()
-
-        # Wrap output file in lazy mapping
-        converted_checkpoint = self._LazyCheckpointMapping(output_path, final_metadata)
-
-        # Generate forensic report from survey metrics
-        forensic_report = self._generate_forensic_report_from_survey(
-            total_parameters=writer.total_parameters,
-            component_counts=writer.component_counts,
-            parameter_counts=writer.parameter_counts,
-            stripped_counts=writer.stripped_counts,
-            architecture=writer.architecture,
-            target_dtype=target_dtype,
-            svd_info=writer.svd_info,  # SVD info aggregated across tensors
-        )
-
-        # UI summary
-        quality_pct = self._estimate_quality_retention(target_dtype)
-        ui_summary = self._format_ui_summary(len(writer.tensor_list), target_dtype, quality_pct, writer.stripped_counts, writer.svd_info)
-
-        # Load MODEL/CLIP/VAE objects from lazy mapping
-        output_vae = not strip_vae
-        output_clip = not (strip_te or strip_clip)
-        try:
-            model, clip, vae = load_state_dict_as_model_objects(
-                converted_checkpoint,
-                metadata=final_metadata,
-                output_vae=output_vae,
-                output_clip=output_clip,
-            )
-        except Exception as e:
-            print(f"⚠️ Failed to load state dict as model objects: {e}")
-            model, clip, vae = None, None, None
-
-        save_path = str(output_path) if save_trigger else ""
-        total_time = time.time() - start_time
-        if debug:
-            print(f"⏱️  Performance timings: streaming total {total_time:.2f}s")
-
-        return (converted_checkpoint, model, clip, vae, save_path, forensic_report)
-
-    def _convert_from_dict(self, tensors, source_metadata, save_trigger, filename,
+    def _convert_in_memory(self, tensors, source_metadata, save_trigger, filename,
                            precision, device, strip_vae, strip_te, strip_clip,
                            save_folder, keep_metadata,
-                           svd_mode, svd_energy_threshold, debug, node_id):
+                           svd_mode, svd_energy_threshold,
+                           output_format, node_id):
         """
-        Convert directly from an in-memory tensor dict — no intermediate temp file.
-        Mirrors _convert_with_streaming() exactly in structure; only the writer
-        creation differs (passes tensors_dict instead of source_path).
+        Convert directly from in-memory tensor dict — NO temp file written.
+        Used when ``save_trigger=False`` and RAM is sufficient.
+        Falls back to temp file + lazy mapping if model loading fails.
 
-        Returns (checkpoint, model, clip, vae, save_path, forensic_report).
+        When *output_format* starts with ``"gguf_"``, the save path writes a GGUF
+        file instead of .safetensors. Preview path returns FP16 tensors (GGUF is a
+        save-only format; ComfyUI-GGUF handles GGUF loading separately).
+
+        Returns (checkpoint, model, clip, vae, save_path, forensic_report)
+        where ``save_path`` is always ``""`` (no file written) unless saving.
         """
         start_time = time.time()
+
+        # ── Detect GGUF output format early ──
+        gguf_format = is_gguf_precision(output_format)
 
         # Determine target device and dtype
         target_device = DeviceManager.get_device(device)
         target_dtype = DeviceManager.get_dtype(precision, target_device)
-
-        # Build options dict (same as _convert_with_streaming)
-        options = {
-            'precision': precision,
-            'device': device,
-            'strip_vae': strip_vae,
-            'strip_te': strip_te,
-            'strip_clip': strip_clip,
-            'svd_mode': svd_mode,
-            'svd_energy_threshold': svd_energy_threshold,
-            'keep_metadata': keep_metadata,
-        }
-
-        # Determine output path (same logic as _convert_with_streaming)
-        if save_trigger:
-            output_path = self._resolve_output_path(save_folder, filename)
+        if gguf_format:
+            print(f"🔧 Target device: {target_device}, GGUF format: {output_format}")
         else:
-            output_path = get_experiment_temp_path("checkpoint_studio")
-            output_path = output_path.with_suffix('.safetensors')
-            ThreadSafeCleanup.register_temp_file(output_path)
+            print(f"🔧 Target device: {target_device}, dtype: {target_dtype}")
 
-        # Create writer with tensors_dict instead of source_path
-        print(f"   ↪ Direct dict-to-output streaming (no temp file)")
-        writer = self._SafetensorsStreamWriter(
-            parent=self,
-            tensors_dict=tensors,           # KEY DIFFERENCE from _convert_with_streaming
-            output_path=output_path,
-            metadata=source_metadata,       # from _parse_checkpoint_data
-            options=options,
+        # ── 1. Capture forensic data BEFORE processing ──
+        _forensic_analysis = self._analyze_checkpoint_structure(tensors, target_dtype)
+        print(f"   🏗️ Architecture: {_forensic_analysis['architecture']}")
+        print(f"   📊 {_forensic_analysis['total_parameters_billions']:.2f}B parameters, "
+              f"{_forensic_analysis['total_size_gb']:.2f} GB")
+
+        # Architecture-aware tip: Flux on old GPU — suggest T5 stripping
+        if _forensic_analysis.get('architecture') == 'flux':
+            if precision == "old_gpu":
+                print(f"💡 Tip: Flux on old GPU — consider also enabling `strip_te=True` "
+                      f"to remove the T5 text encoder (~3 GB saved)")
+            elif precision == "device_optimized" and target_dtype == torch.int8:
+                print(f"💡 Tip: This machine is an old GPU (CC < 8). For Flux, consider "
+                      f"also enabling `strip_te=True` (~3 GB saved)")
+
+        # ── Detect raw architecture for GGUF writer (needs "flux", "sd15", etc.) ──
+        gguf_arch = None
+        if gguf_format:
+            keys_list = list(tensors.keys())
+            if detect_checkpoint_architecture is not None:
+                arch_raw = detect_checkpoint_architecture(keys_list)
+            else:
+                arch_raw = "Unknown"
+            gguf_arch = gguf_arch_from_arch(arch_raw)
+            if gguf_arch is None:
+                print(f"   ⚠️ GGUF export not supported for architecture '{arch_raw}'. "
+                      f"Supported: {sorted(GGUF_SUPPORTED_ARCHS)}")
+                print(f"   ⚠️ Falling back to safetensors output.")
+                gguf_format = False  # disable GGUF, proceed as normal safetensors
+                output_format = "safetensors"
+            else:
+                print(f"   🏗️ GGUF architecture: {gguf_arch} (raw: {arch_raw})")
+
+        # ── 2a. SVD preprocessing (applied to ORIGINAL float32 tensors) ──
+        # This runs BEFORE quantization so SVD operates on meaningful float values,
+        # not on quantized integers. Companion scales computed during quantization
+        # will automatically reflect SVD-corrected values.
+        # NOTE: GGUF mode also benefits from SVD preprocessing when the processed
+        # tensors are converted to FP16 for preview (the GGUF file itself goes
+        # through GGUFSaveWriter which does its own block-wise quantization).
+        svd_info = None
+        if svd_mode != "none":
+            print(f"🔧 Applying SVD preprocessing ({svd_mode})...")
+            svd_info = apply_svd_preprocess(
+                tensors, svd_mode, svd_energy_threshold,
+                target_device=target_device,
+            )
+            if svd_info['compressed_layers'] > 0:
+                print(f"🔧 SVD processed {svd_info['compressed_layers']} layers "
+                      f"(rank ratio {svd_info['avg_rank_ratio']:.3f})")
+
+        # ── 2b. Process tensors (strip + convert dtype) ──
+        processed = {}
+        stripped_counts = {"vae": 0, "te": 0, "clip": 0}
+        total_tensors = len(tensors)
+        if gguf_format:
+            # GGUF mode: strip components, convert to FP16 for preview/model loading.
+            # No INT8/FP8 quantization — GGUFSaveWriter handles block-wise quant.
+            # No companion scales needed.
+            for key, tensor in tensors.items():
+                if self._should_strip_key(key, strip_vae, strip_te,
+                                          strip_clip, stripped_counts):
+                    continue
+                # Convert to FP16 for ComfyUI preview (GGUF is save-only format)
+                t = tensor.detach().cpu()
+                if t.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+                    t = t.float()
+                elif t.dtype == torch.bfloat16:
+                    t = t.half()  # BF16 → FP16 for ComfyUI compatibility
+                processed[key] = t
+            print(f"   📋 GGUF mode: {len(processed)} tensors (FP16 preview)")
+        elif precision == "svd_only":
+            # SVD-only mode: skip quantization, copy SVD'd float32 tensors directly.
+            # SVD preprocessing already ran above (step 2a), replacing qualifying
+            # tensors with low-rank float32 reconstructions in-place.
+            # No companion scales, no dtype conversion, no quantization needed.
+            for key, tensor in tensors.items():
+                if self._should_strip_key(key, strip_vae, strip_te,
+                                          strip_clip, stripped_counts):
+                    continue
+                processed[key] = tensor
+            print(f"   📋 SVD-only mode: {len(processed)} tensors "
+                  f"(float32, SVD compressed)")
+        elif total_tensors > 0:
+            node_prefix = f"[{node_id}] " if node_id else ""
+            with ProgressTracker(total=total_tensors,
+                                 desc=f"{node_prefix}Processing tensors") as convert_progress:
+                for key, tensor in tensors.items():
+                    # Component stripping
+                    if self._should_strip_key(key, strip_vae, strip_te,
+                                              strip_clip, stripped_counts):
+                        convert_progress += 1
+                        continue
+                    new_key = key
+
+                    # FP8: preserve BF16 for sensitive layers
+                    effective_dtype = target_dtype
+                    if target_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                        # Sensitive layers (by pattern) — the same patterns used by
+                        # Creator's FP8 and aligned with INT8_PRESERVE_FP16_PATTERNS.
+                        if self._should_preserve_bf16(key):
+                            effective_dtype = torch.bfloat16
+                        # 1D weight tensors (norms, biases, scale factors) are critical
+                        # for quality and tiny in memory (~KB each). INT8 auto-preserves
+                        # them in FP16 via the `tensor.dim() >= 2` guard at line 1111;
+                        # FP8 mirrors this by preserving ALL dim<2 tensors in BF16,
+                        # not just pattern-matched ones. This catches Anima's 169 norm
+                        # weight tensors (k_norm.weight, q_norm.weight, norm_*.weight)
+                        # and similar 1D parameters in all architectures.
+                        elif tensor.dim() < 2:
+                            effective_dtype = torch.bfloat16
+
+                    # Determine if this tensor needs FP8 companion scales
+                    # Scales must be computed from the ORIGINAL float tensor
+                    # BEFORE quantization to FP8 (max/abs operations fail on fp8)
+                    _needs_fp8_scales = (
+                        effective_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                        and target_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                        and new_key.endswith('.weight')
+                    )
+
+                    # INT8: companion scale determination
+                    # Sensitive layers (input/output projections, modulation, norm
+                    # weights) are preserved in FP16 — INT8's zero mantissa bits
+                    # corrupt them disproportionately.
+                    _needs_int8_scales = (
+                        target_dtype == torch.int8
+                        and effective_dtype == torch.int8
+                        and new_key.endswith('.weight')
+                        and tensor.dim() >= 2  # 1D weights cannot use per-channel quantization
+                        and not self._should_skip_int8(key)
+                        and not self._should_preserve_fp16_for_int8(key)
+                    )
+                    if target_dtype == torch.int8 and not _needs_int8_scales:
+                        effective_dtype = torch.float16
+
+                    # ── GPU-accelerated conversion ──────────────────────────────
+                    # Move tensor to GPU before dtype conversion / FP8 quantization
+                    # so that max/abs (weight scale) and quantize_to_fp8 run on GPU.
+                    # Move back to CPU for storage to prevent GPU OOM accumulation.
+                    moved_to_gpu = False
+                    if target_device is not None and target_device.type == 'cuda':
+                        tensor = tensor.to(device=target_device, non_blocking=True)
+                        moved_to_gpu = True
+                    # ────────────────────────────────────────────────────────────
+
+                    # Cast dtype if needed — compute scales BEFORE quantization
+                    if tensor.dtype != effective_dtype:
+                        if _needs_fp8_scales:
+                            weight_scale = self._compute_weight_scale(tensor, effective_dtype)
+                            input_scale = self._compute_weight_scale(tensor, effective_dtype)
+                            tensor = self._quantize_to_fp8(tensor, effective_dtype)
+                        elif _needs_int8_scales:
+                            q, wscale = quantize_to_int8(
+                                tensor,
+                                use_convrot=(precision == "int8_convrot"),
+                            )
+                            weight_scale = wscale
+                            tensor = q
+                        else:
+                            tensor = tensor.to(dtype=effective_dtype)
+                    elif _needs_fp8_scales:
+                        weight_scale = self._compute_weight_scale(tensor, effective_dtype)
+                        input_scale = self._compute_weight_scale(tensor, effective_dtype)
+                    elif _needs_int8_scales:
+                        # Per-channel scale via compute_int8_scale (applies percentile clipping
+                        # for outlier reduction, same as the quantize_to_int8 path)
+                        weight_scale = compute_int8_scale(tensor)
+
+                    # Move back to CPU for storage (prevents GPU OOM from accumulating tensors)
+                    if moved_to_gpu:
+                        tensor = tensor.cpu()
+                        if _needs_fp8_scales:
+                            weight_scale = weight_scale.cpu()
+                            input_scale = input_scale.cpu()
+                        if _needs_int8_scales:
+                            weight_scale = weight_scale.cpu()
+
+                    if not tensor.is_contiguous():
+                        tensor = tensor.contiguous()
+
+                    # Store companion scale tensors (harmless extra keys for ComfyUI)
+                    if _needs_fp8_scales:
+                        # 🔥 FIX: Strip '.weight' from key so scale tensors are named
+                        # `{layer}.weight_scale` instead of `{layer}.weight.weight_scale`.
+                        # ComfyUI's MixedPrecisionOps expects {prefix}weight_scale.
+                        base_key = new_key[:-len('.weight')]  # new_key.endswith('.weight') guaranteed
+                        processed[base_key + '.weight_scale'] = weight_scale.cpu()
+                        processed[base_key + '.input_scale'] = input_scale.cpu()
+                    elif _needs_int8_scales:
+                        base_key = new_key[:-len('.weight')]
+                        processed[base_key + '.weight_scale'] = weight_scale.cpu()
+
+                    processed[new_key] = tensor
+                    convert_progress += 1
+        else:
+            print("⚠️ No tensors to process")
+
+        # ── 3. Free original tensors — recover RAM before SVD/metadata ──
+        del tensors
+        cleanup_memory()
+        print(f"   ✅ Freed original tensors — "
+              f"{_forensic_analysis['total_size_gb']:.2f} GB recovered")
+
+        # Report stripping
+        if any(stripped_counts.values()):
+            print(f"🔪 Stripped components: VAE {stripped_counts['vae']}, "
+                  f"TE {stripped_counts['te']}, CLIP {stripped_counts['clip']}")
+
+        # ── 3. Metadata ──
+        mode = "preserve_a" if keep_metadata else "none"
+        extra = self._build_architecture_extra(_forensic_analysis['architecture'])
+        final_metadata = finalize_metadata(
+            metadata=source_metadata,
+            mode=mode,
+            component="checkpoint_studio",
+            extra_fields=extra,
         )
-        # First pass: survey
-        header, total_parameters, component_counts = writer.survey()
-        # Metadata already finalized in survey, use writer.metadata
-        final_metadata = writer.metadata
-        # Second pass: weave (reads from dict, writes to file)
-        writer.weave()
 
-        # Wrap output file in lazy mapping
-        converted_checkpoint = self._LazyCheckpointMapping(output_path, final_metadata)
+        # Quantization metadata + dequant_target hint
+        # Handles both FP8 (E4M3/E5M2) and INT8 quantized formats.
+        # GGUF skips this entirely — it has its own metadata in the GGUF file.
+        # NOTE: dequant_target is stripped from save_metadata (internal-only key).
+        # Downstream loaders get_dequant_dtype() auto-detects from GPU capability.
+        if not gguf_format and target_dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.int8):
+            if target_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                final_metadata['dequant_target'] = 'bfloat16'
+            else:  # INT8
+                final_metadata['dequant_target'] = 'float16'
+            print(f"   🏷️ dequant_target={final_metadata['dequant_target']}")
 
-        # Generate forensic report from survey metrics (same as _convert_with_streaming)
-        forensic_report = self._generate_forensic_report_from_survey(
-            total_parameters=writer.total_parameters,
-            component_counts=writer.component_counts,
-            parameter_counts=writer.parameter_counts,
-            stripped_counts=writer.stripped_counts,
-            architecture=writer.architecture,
-            target_dtype=target_dtype,
-            svd_info=writer.svd_info,
-        )
+            # FP8-only: build quantization metadata (INT8 does not use this)
+            if target_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                fp8_dtype_str = 'F8_E4M3' if target_dtype == torch.float8_e4m3fn else 'F8_E5M2'
+                tensor_meta_list = []
+                for k, v in processed.items():
+                    is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                    tensor_meta_list.append({
+                        'new_key': k,
+                        'dtype': fp8_dtype_str if is_fp8 else 'BF16',
+                    })
+                qmeta = self._build_quantization_metadata(tensor_meta_list, fp8_dtype_str)
+                if qmeta:
+                    final_metadata['_quantization_metadata'] = json.dumps(qmeta)
+                    print(f"   📋 Added quantization metadata "
+                          f"({len(qmeta.get('layers', {}))} FP8 layers)")
 
-        # UI summary
-        quality_pct = self._estimate_quality_retention(target_dtype)
-        ui_summary = self._format_ui_summary(len(writer.tensor_list), target_dtype, quality_pct, writer.stripped_counts, writer.svd_info)
-
-        # Load MODEL/CLIP/VAE objects from lazy mapping (same as _convert_with_streaming)
+        # ── 4. Save or preview dispatch ─────────────────────────────────
+        save_path = ""
         output_vae = not strip_vae
         output_clip = not (strip_te or strip_clip)
+        model_loading_metadata = final_metadata.copy()
+        # Both paths keep _quantization_metadata for MixedPrecisionOps detection.
+        # Save path: uses in-memory processed dict (raw FP8 tensors + metadata).
+        # Preview path: same — in-memory FP8 tensors + metadata.
+        # INT8 is the only exception: strips _quantization_metadata because
+        # ComfyUI does not support INT8 natively (saves native INT8 format,
+        # requires ComfyUI-Flux2-INT8 to load).
+        # GGUF: metadata lives inside the .gguf file, not in safetensors header.
+
+        # Build save-time metadata: strip internal-only keys (`dequant_target`)
+        # and project signature keys (`modelspec.*`) so saved files match the
+        # Creator's metadata layout — no extra keys that confuse external loaders.
+        save_metadata = {
+            k: v for k, v in final_metadata.items()
+            if k not in ('dequant_target',)
+            and not k.startswith('modelspec.')
+        }
+
+        if save_trigger:
+            # ── GGUF save path ───────────────────────────────────────────
+            # GGUF is a save-only format. The writer handles its own block-wise
+            # quantization internally, including:
+            #   - dtype conversion (BF16/FP16/FP8 → FP32 → quantise)
+            #   - 1D tensor preservation (F32)
+            #   - Shape rearrangement for CNN models (SD1.5/SDXL)
+            #   - Metadata (architecture, file type, quant version)
+            if gguf_format:
+                from .gguf_writer import GGUFSaveWriter, gguf_qtype_from_precision
+                gguf_qtype = gguf_qtype_from_precision(output_format)
+                if gguf_qtype is None:
+                    print(f"   ⚠️ Unknown GGUF format '{output_format}', "
+                          f"falling back to safetensors.")
+                else:
+                    # Determine if shape rearrangement is needed
+                    # Flux/transformer models: shape_fix=False
+                    # SD1.5/SDXL (CNN UNets): shape_fix=True
+                    needs_shape_fix = gguf_arch in ("sd1", "sdxl")
+                    writer = GGUFSaveWriter(
+                        output_path="",  # will set after resolving path
+                        arch_raw=gguf_arch,
+                        quant_type=gguf_qtype,
+                        shape_fix=needs_shape_fix,
+                    )
+                    # Write all tensors through the GGUF writer
+                    for key, tensor in processed.items():
+                        writer.add_tensor(key, tensor)
+                    # Resolve output path with .gguf extension
+                    output_path = self._resolve_output_path(
+                        save_folder, filename, extension=".gguf"
+                    )
+                    writer._output_path = str(output_path)
+                    writer.finalize()
+                    save_path = str(output_path)
+                    print(f"💾 Saved to: {save_path} (GGUF {output_format})")
+                    print(f"   ✅ GGUF file — load with ComfyUI-GGUF Unet Loader node.")
+                    # For model loading, return FP16 tensors (same as preview)
+                    converted_checkpoint = processed
+                    # Skip safetensors save logic below
+                    # (fall through to model loading section)
+
+            # ── Safetensors save path (existing logic) ───────────────────
+            if not gguf_format:
+                # Save path: keep _quantization_metadata in model_loading_metadata for
+                # MixedPrecisionOps detection. Use in-memory processed dict directly
+                # (no _LazyCheckpointMapping) so FP8 tensors reach the model loader
+                # intact — matching CheckpointLoaderSimple's loading path exactly.
+                if target_dtype == torch.int8:
+                    # Native INT8 save — requires ComfyUI-Flux2-INT8 custom node to load.
+                    is_convrot = (precision == "int8_convrot")
+
+                    # 1. Reshape weight_scale [C] → [C, 1] for Flux2-INT8 per-row detection
+                    for k in list(processed.keys()):
+                        if k.endswith('.weight_scale'):
+                            processed[k] = processed[k].unsqueeze(-1)
+
+                    # 2. Generate comfy_quant metadata per INT8 weight layer
+                    _convrot_group_size = 256
+                    for k in list(processed.keys()):
+                        if k.endswith('.weight') and processed[k].dtype == torch.int8:
+                            base = k[:-len('.weight')]
+                            layer_in_features = processed[k].shape[-1]
+                            layer_convrot = (
+                                is_convrot
+                                and layer_in_features % _convrot_group_size == 0
+                            )
+                            conf = {"convrot": layer_convrot}
+                            if layer_convrot:
+                                conf["convrot_groupsize"] = _convrot_group_size
+                            processed[base + '.comfy_quant'] = torch.tensor(
+                                list(json.dumps(conf).encode('utf-8')), dtype=torch.uint8
+                            )
+
+                    # 3. Strip _quantization_metadata
+                    save_metadata.pop('_quantization_metadata', None)
+                    model_loading_metadata.pop('_quantization_metadata', None)
+
+                    int8_count = sum(1 for v in processed.values() if v.dtype == torch.int8)
+                    print(f"   ✅ INT8 native: {int8_count} INT8 tensors + companion scales. ~50% disk savings.")
+                    print(f"   ⚠️  IMPORTANT: This file contains native INT8 tensors.")
+                    print(f"   ⚠️  You MUST have ComfyUI-Flux2-INT8 custom node installed to load it.")
+                    print(f"   ⚠️  https://github.com/BobJohnson24/ComfyUI-INT8-Fast")
+
+                # FP8 save: strip .input_scale companion tensors before writing.
+                if target_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    input_scale_keys = [k for k in processed if k.endswith('.input_scale')]
+                    for k in input_scale_keys:
+                        del processed[k]
+                    if input_scale_keys:
+                        print(f"   🧹 Stripped {len(input_scale_keys)} .input_scale tensors "
+                              f"(MixedPrecisionOps falls back to correct .weight_scale)")
+
+                # Save mode: serialize to safetensors file
+                output_path = self._resolve_output_path(save_folder, filename)
+                save_safetensors_stream(processed, output_path, metadata=save_metadata)
+                save_path = str(output_path)
+                print(f"💾 Saved to: {save_path}")
+
+                # Use in-memory processed dict directly for model loading.
+                converted_checkpoint = processed
+        else:
+            # Preview mode: handle quantized tensor types for direct ComfyUI loading.
+            # FP8: kept as-is containing FP8 tensors + .weight_scale + _quantization_metadata
+            #      → model loader detects MixedPrecisionOps → uses QuantizedTensors
+            # INT8: dequant to FP16 (ComfyUI does not support INT8 natively)
+            # GGUF: already FP16 from processing step
+            if gguf_format:
+                # Already FP16 from processing step — pass directly to model loader
+                converted_checkpoint = processed
+                print(f"🧠 Preview — GGUF mode: FP16 tensors passed to model loader. "
+                      f"(GGUF file written during save_trigger=True)")
+            elif target_dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                # Strip .input_scale to match save path behavior
+                input_scale_keys = [k for k in processed if k.endswith('.input_scale')]
+                for k in input_scale_keys:
+                    del processed[k]
+                converted_checkpoint = processed
+                print(f"🧠 Preview — FP8 tensors passed directly to MixedPrecisionOps. "
+                      f"Stripped {len(input_scale_keys)} .input_scale tensors.")
+            elif target_dtype == torch.int8:
+                is_convrot_preview = (precision == "int8_convrot")
+                for k in list(processed.keys()):
+                    v = processed[k]
+                    if v.dtype == torch.int8:
+                        deq = dequant_int8_tensor(v, k, torch.float16, processed)
+                        if is_convrot_preview:
+                            try:
+                                import importlib
+                                _convrot_mod = importlib.import_module(
+                                    "custom_nodes.ComfyUI-Flux2-INT8.convrot"
+                                )
+                                H = _convrot_mod.build_hadamard(
+                                    256, device=deq.device, dtype=deq.dtype
+                                )
+                                deq = _convrot_mod.rotate_weight(
+                                    deq, H, group_size=256
+                                )
+                            except (ImportError, AttributeError):
+                                print("   ⚠️ ConvRot preview: Flux2-INT8 not found, "
+                                      "skipping inverse rotation.")
+                        processed[k] = deq
+                for k in list(processed.keys()):
+                    if k.endswith('.weight_scale'):
+                        del processed[k]
+                mode_str = "ConvRot " if is_convrot_preview else ""
+                print(f"🧠 Preview — INT8 tensors dequantized to FP16 in-memory. ({mode_str}dequant)")
+                converted_checkpoint = processed
+            else:
+                converted_checkpoint = processed
+
+        # ── 5. Load MODEL/CLIP/VAE objects ──────────────────────────────
+        _pre_load_ram = get_available_ram()
+        model, clip, vae = None, None, None
         try:
             model, clip, vae = load_state_dict_as_model_objects(
                 converted_checkpoint,
-                metadata=final_metadata,
-                output_vae=output_vae,
-                output_clip=output_clip,
+                metadata=model_loading_metadata,
+                output_vae=output_vae, output_clip=output_clip,
             )
         except Exception as e:
-            print(f"⚠️ Failed to load state dict as model objects: {e}")
+            print(f"⚠️ Model loading failed: {e}")
             model, clip, vae = None, None, None
 
-        save_path = str(output_path) if save_trigger else ""
-        total_time = time.time() - start_time
-        if debug:
-            print(f"⏱️  Performance timings: dict-stream total {total_time:.2f}s")
+        print_ram_delta(_pre_load_ram, get_available_ram(), "load")
+
+        # ── 6. Generate forensic report ──
+        forensic_report = self._generate_forensic_report_from_analysis(
+            _forensic_analysis, converted_checkpoint, target_dtype,
+            stripped_counts, svd_info,
+            output_format=output_format,
+        )
+
+        # ── 7. UI summary ──
+        if gguf_format:
+            quality_pct = self._estimate_quality_retention(None, output_format=output_format)
+        else:
+            quality_pct = self._estimate_quality_retention(target_dtype)
+        ui_summary = self._format_ui_summary(
+            len(converted_checkpoint) if isinstance(converted_checkpoint, dict) else 0,
+            target_dtype, quality_pct,
+            stripped_counts, svd_info,
+            output_format=output_format,
+        )
+        print(f"   {ui_summary}")
+
+        print(f"⏱️  In-memory conversion total: {time.time() - start_time:.2f}s")
 
         return (converted_checkpoint, model, clip, vae, save_path, forensic_report)
 
@@ -1432,21 +1448,207 @@ class MusubiCheckpointStudio:
     FUNCTION = "convert"
     CATEGORY = "Checkpoint/Universal"
 
+    @staticmethod
+    def _make_ram_insufficient_return(tensors_dict, meta, device, label="checkpoint_studio"):
+        """Save source to temp, wrap in _LazyCheckpointMapping, return as-is
+        (no conversion applied — user should increase RAM or use save_trigger=True).
+
+        Uses GPU‑aware dequant target so the temp mapping is compatible
+        with the local GPU (handles cross‑compilation scenario implicitly).
+        
+        ``get_experiment_temp_path()`` auto-registers cleanup via ThreadSafeCleanup,
+        so callers do not need to register the temp file manually.
+        """
+        temp_path = get_experiment_temp_path(label)
+        save_safetensors_stream(tensors_dict, temp_path, metadata=meta)
+        del tensors_dict
+        cleanup_memory()
+        # Resolve dequant target from local GPU capability; no file metadata
+        # yet, so get_dequant_dtype falls back to auto‑detect.
+        _dequant_target = get_dequant_dtype(target_device=device)
+        converted = MusubiCheckpointStudio._LazyCheckpointMapping(
+            temp_path, meta, target_dtype=_dequant_target,
+        )
+        # Generate minimal forensic report (no conversion happened)
+        forensic_report = (
+            f"🛡️ --- CHECKPOINT STUDIO: FORENSIC REPORT --- 🛡️\n"
+            f"⚠️ INSUFFICIENT RAM — no conversion applied\n"
+            f"📅 DATE: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        return (converted, None, None, None, "", forensic_report)
+
+    def _convert_from_lazy_mapping(self, tensors, metadata, studio_kwargs, device):
+        """Handle ``_LazyCheckpointMapping`` input: estimate size from header,
+        load into RAM if sufficient, otherwise passthrough without conversion.
+
+        Args:
+            tensors: A ``_LazyCheckpointMapping`` instance.
+            metadata: Source metadata dict (may be updated with lazy mapping metadata).
+            studio_kwargs: Shared kwargs dict for ``_convert_in_memory()``.
+            device: Target device for dequant dtype resolution.
+        """
+        filepath = tensors.filepath
+        _dtype_byte_map = {
+            'F32': 4, 'F16': 2, 'BF16': 2,
+            'F8_E4M3': 1, 'F8_E5M2': 1, 'F8': 1,
+        }
+        try:
+            file_header, file_meta = read_safetensors_header_only(Path(filepath))
+            total_bytes = 0
+            for info in file_header.values():
+                if isinstance(info, dict):
+                    shape = info.get('shape', [])
+                    elem = _dtype_byte_map.get(info.get('dtype', 'F32'), 4)
+                    numel = 1
+                    for d in shape:
+                        numel *= d
+                    total_bytes += numel * elem
+
+            if check_ram_guard(
+                total_bytes, len(file_header), 1,
+                label="checkpoint_studio_lazy", use_dict=True,
+            ):
+                print(f"   🧠 RAM sufficient — loading file-backed tensors into memory")
+                from safetensors import safe_open
+                loaded = {}
+                with safe_open(filepath, framework='pt') as sf:
+                    for key in sf.keys():
+                        loaded[key] = sf.get_tensor(key)
+                # Merge metadata from lazy mapping if available
+                lazy_meta = getattr(tensors, '_metadata', {}) or {}
+                if lazy_meta:
+                    metadata = lazy_meta
+                return self._convert_in_memory(
+                    tensors=loaded, source_metadata=metadata, **studio_kwargs,
+                )
+            else:
+                print(f"   ℹ️ Insufficient RAM — passing through lazy mapping without conversion")
+                return self._make_ram_insufficient_return(
+                    tensors, metadata, device, label="checkpoint_studio_lazy"
+                )
+        except Exception as e:
+            print(f"   ⚠️ Header read failed ({e}) — trying direct in-memory conversion")
+            # Attempt conversion anyway; _convert_in_memory may OOM
+            return self._convert_in_memory(
+                tensors=tensors, source_metadata=metadata, **studio_kwargs,
+            )
+
+    def _handle_file_preview(self, path, studio_kwargs, device):
+        """Preview mode for a ``.safetensors`` file: load into RAM if sufficient,
+        otherwise return a lazy mapping directly on the source file.
+
+        No temp file is created — the lazy mapping reads from the original source.
+        """
+        _dtype_byte_map = {
+            'F32': 4, 'F16': 2, 'BF16': 2,
+            'F8_E4M3': 1, 'F8_E5M2': 1, 'F8': 1,
+        }
+        try:
+            file_header, file_metadata = read_safetensors_header_only(path)
+            total_bytes = 0
+            for info in file_header.values():
+                if isinstance(info, dict):
+                    shape = info.get('shape', [])
+                    elem = _dtype_byte_map.get(info.get('dtype', 'F32'), 4)
+                    numel = 1
+                    for d in shape:
+                        numel *= d
+                    total_bytes += numel * elem
+
+            if check_ram_guard(
+                total_bytes, len(file_header), 1,
+                label="checkpoint_studio_file_preview", use_dict=True,
+            ):
+                print(f"   🧠 RAM sufficient — loading into memory for preview (no temp file)")
+                from safetensors import safe_open
+                loaded = {}
+                with safe_open(str(path), framework='pt') as sf:
+                    for key in sf.keys():
+                        loaded[key] = sf.get_tensor(key)
+                return self._convert_in_memory(
+                    tensors=loaded, source_metadata=file_metadata, **studio_kwargs,
+                )
+            else:
+                print(f"   ℹ️ Insufficient RAM for preview — returning lazy mapping on source file")
+                _dequant_target = get_dequant_dtype(target_device=device)
+                converted = self._LazyCheckpointMapping(
+                    path, file_metadata, target_dtype=_dequant_target,
+                )
+                forensic_report = (
+                    f"🛡️ --- CHECKPOINT STUDIO: FORENSIC REPORT --- 🛡️\n"
+                    f"⚠️ INSUFFICIENT RAM — no conversion applied\n"
+                    f"📅 DATE: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+                return (converted, None, None, None, "", forensic_report)
+        except Exception as e:
+            print(f"   ⚠️ RAM check failed ({e}) — returning lazy mapping on source file")
+            _dequant_target = get_dequant_dtype(target_device=device)
+            converted = self._LazyCheckpointMapping(
+                path, {}, target_dtype=_dequant_target,
+            )
+            forensic_report = (
+                f"🛡️ --- CHECKPOINT STUDIO: FORENSIC REPORT --- 🛡️\n"
+                f"⚠️ RAM CHECK FAILED — no conversion applied\n"
+                f"📅 DATE: {time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+            return (converted, None, None, None, "", forensic_report)
+
+    def _handle_file_save(self, path, studio_kwargs):
+        """Save mode for a ``.safetensors`` file: load into dict and convert."""
+        from safetensors import safe_open
+        loaded = {}
+        with safe_open(str(path), framework='pt') as sf:
+            for key in sf.keys():
+                loaded[key] = sf.get_tensor(key)
+        # Read metadata from file header
+        try:
+            _, file_metadata = read_safetensors_header_only(path)
+        except Exception:
+            file_metadata = {}
+        return self._convert_in_memory(
+            tensors=loaded, source_metadata=file_metadata, **studio_kwargs,
+        )
+
+    def _handle_non_safetensors_file(self, path, studio_kwargs):
+        """Convert a non-safetensors checkpoint by loading into memory first."""
+        tensors, metadata = load_lora_with_metadata(path)
+        return self._convert_in_memory(
+            tensors=tensors, source_metadata=metadata, **studio_kwargs,
+        )
+
     def convert(self, checkpoint="None", save_trigger=False, filename="converted_checkpoint",
                 precision="auto", device="auto", strip_vae=False, strip_te=False, strip_clip=False,
                 checkpoint_data=None, save_folder="", keep_metadata=True,
                 svd_mode="none", svd_energy_threshold=0.95,
-                debug=False, node_id=None):
+                node_id=None,
+                output_format="safetensors"):
         """
         Main conversion routine.
+        All processing is routed through ``_convert_in_memory()``.
+        The buggy ``_SafetensorsStreamWriter`` has been removed (was the root cause of
+        safetensors corruption during FP8→FP8 re-conversion).
         """
         print("\n" + "="*50)
         print(">>> Easy Checkpoint Studio")
         print("="*50)
 
-        start_time = time.time()
-        timings = {}
-        stage_start = start_time
+        # ══ Runtime precision guard — protect against stale workflow JSONs ══
+        if precision not in PRECISION_STUDIO:
+            print(f"   ⚠️ Precision '{precision}' is no longer available, falling back to 'auto'")
+            precision = "auto"
+
+        # ── Shared kwargs for _convert_in_memory() ──────────────────────────
+        # All non-varying parameters are captured once here, eliminating
+        # the repetitive parameter call signature at every dispatch branch.
+        _studio_kwargs = dict(
+            save_trigger=save_trigger, filename=filename,
+            precision=precision, device=device,
+            strip_vae=strip_vae, strip_te=strip_te, strip_clip=strip_clip,
+            save_folder=save_folder, keep_metadata=keep_metadata,
+            svd_mode=svd_mode, svd_energy_threshold=svd_energy_threshold,
+            node_id=node_id,
+            output_format=output_format,
+        )
 
         # Determine source
         tensors = {}
@@ -1455,37 +1657,19 @@ class MusubiCheckpointStudio:
             # Parse checkpoint_data (CHECKPOINT type)
             try:
                 tensors, metadata = self._parse_checkpoint_data(checkpoint_data)
-                print(f"📄 Source: CHECKPOINT data input ({len(tensors)} tensors)")
+                print(f"📄 Source: CHECKPOINT data input ({len(tensors)} tensors, type={type(tensors).__name__})")
             except Exception as e:
                 print(f"❌ Failed to parse checkpoint_data: {e}")
                 return (None, None, None, None, "", "Invalid checkpoint_data")
 
-            # ── Phase 2: Three-way dispatch ──────────────────────────────────
-            # Priority:
-            #   1. LazyCheckpointMapping short-circuit → file-based streaming
-            #   2. RAM guard pass → dict-to-output streaming (no temp file)
-            #   3. RAM guard fail → temp file fallback → file-based streaming
-
-            # 1. Short-circuit: if input is already a _LazyCheckpointMapping,
-            #    extract its filepath and use file-based streaming directly.
-            #    This avoids materializing lazy-mapping tensors just for
-            #    metadata/survey (see plan for rationale).
+            # ── Handle _LazyCheckpointMapping ────────────────────────────
+            # Delegate to dedicated helper (extracted for clarity — see above).
             if isinstance(tensors, self._LazyCheckpointMapping):
-                print(f"   ↪ Input is already file-backed — streaming directly from file")
-                return self._convert_with_streaming(
-                    source_path=tensors.filepath,
-                    save_trigger=save_trigger, filename=filename,
-                    precision=precision, device=device,
-                    strip_vae=strip_vae, strip_te=strip_te, strip_clip=strip_clip,
-                    save_folder=save_folder, keep_metadata=keep_metadata,
-                    svd_mode=svd_mode, svd_energy_threshold=svd_energy_threshold,
-                    debug=debug, node_id=node_id,
+                return self._convert_from_lazy_mapping(
+                    tensors, metadata, _studio_kwargs, device
                 )
 
-            # 2. RAM guard: calculate total data size and check if
-            #    direct dict streaming is safe.
-            # NOTE: For real dicts, .numel() and .element_size() are
-            # metadata-only — no tensor data materialization.
+            # ── Plain dict: check RAM guard ──────────────────────────────
             total_bytes = sum(
                 t.numel() * t.element_size() for t in tensors.values()
             )
@@ -1493,227 +1677,29 @@ class MusubiCheckpointStudio:
                 total_bytes, len(tensors), 1,
                 label="checkpoint_studio", use_dict=True,
             ):
-                # ✅ Direct dict-to-output streaming — no temp file
-                return self._convert_from_dict(
-                    tensors=tensors, source_metadata=metadata,
-                    save_trigger=save_trigger, filename=filename,
-                    precision=precision, device=device,
-                    strip_vae=strip_vae, strip_te=strip_te, strip_clip=strip_clip,
-                    save_folder=save_folder, keep_metadata=keep_metadata,
-                    svd_mode=svd_mode, svd_energy_threshold=svd_energy_threshold,
-                    debug=debug, node_id=node_id,
+                return self._convert_in_memory(
+                    tensors=tensors, source_metadata=metadata, **_studio_kwargs,
                 )
             else:
-                # ❌ RAM too low — save to temp file, free dict, stream from file
-                print(f"   ℹ️  RAM Guard triggered: falling back to temp-file streaming")
-                temp_path = get_experiment_temp_path("checkpoint_studio")
-                temp_path = temp_path.with_suffix('.safetensors')
-                save_safetensors_stream(tensors, temp_path, metadata=metadata)
-                del tensors
-                cleanup_memory()
-                ThreadSafeCleanup.register_temp_file(temp_path)
-                return self._convert_with_streaming(
-                    source_path=temp_path,
-                    save_trigger=save_trigger, filename=filename,
-                    precision=precision, device=device,
-                    strip_vae=strip_vae, strip_te=strip_te, strip_clip=strip_clip,
-                    save_folder=save_folder, keep_metadata=keep_metadata,
-                    svd_mode=svd_mode, svd_energy_threshold=svd_energy_threshold,
-                    debug=debug, node_id=node_id,
-                )
+                print(f"   ℹ️ RAM insufficient — saving to temp file for lazy passthrough")
+                return self._make_ram_insufficient_return(tensors, metadata, device)
         else:
             if checkpoint == "None" or not checkpoint:
                 print("❌ No checkpoint input provided")
                 return (None, None, None, None, "", "No input")
-            # Get full path
             path = folder_paths.get_full_path("checkpoints", checkpoint)
             if path is None:
                 print(f"❌ Checkpoint file not found: {checkpoint}")
                 return (None, None, None, None, "", "File not found")
             print(f"📄 Source: {checkpoint}")
             print(f"📁 Path: {path}")
-            # Check if file is safetensors (magic bytes)
-            try:
-                with open(path, 'rb') as f:
-                    magic = f.read(8)
-            except Exception:
-                magic = b''
-            if magic[:7] == b'__safet':
-                # Use streaming writer for file source (flat‑RAM guarantee)
-                return self._convert_with_streaming(
-                    source_path=path,
-                    save_trigger=save_trigger,
-                    filename=filename,
-                    precision=precision,
-                    device=device,
-                    strip_vae=strip_vae,
-                    strip_te=strip_te,
-                    strip_clip=strip_clip,
-                    save_folder=save_folder,
-                    keep_metadata=keep_metadata,
-                    svd_mode=svd_mode,
-                    svd_energy_threshold=svd_energy_threshold,
-                    debug=debug,
-                    node_id=node_id,
-                )
-            else:
-                # Fallback: load tensors into memory (original path)
-                tensors, metadata = load_lora_with_metadata(Path(path))
-        
-        timings['loading'] = time.time() - stage_start
-        stage_start = time.time()
-        print(f"✅ Loaded {len(tensors)} tensors")
-        if debug:
-            print(f"   Sample keys: {list(tensors.keys())[:3]}")
 
-        # ── RAM Guard: report available memory vs data size ────────────────
-        _total_bytes = sum(t.numel() * t.element_size() for t in tensors.values())
-        _avail = get_available_ram()
-        if _avail is not None:
-            _data_gb = _total_bytes / (1024**3)
-            _ram_gb = _avail / (1024**3)
-            print(f"🧠 RAM Guard: Data ~{_data_gb:.2f} GB in {len(tensors)} tensors, "
-                  f"Available RAM ~{_ram_gb:.2f} GB")
-            if _data_gb > _ram_gb * 0.85:
-                print(f"   ⚠️ Data exceeds 85% of available RAM — risk of OOM")
-        
-        # Determine target device and dtype
-        target_device = DeviceManager.get_device(device)
-        target_dtype = DeviceManager.get_dtype(precision, target_device)
-        print(f"🔧 Target device: {target_device}, dtype: {target_dtype}")
-        
-        # Process tensors
-        processed = {}
-        stripped_counts = {"vae": 0, "te": 0, "clip": 0}
-        total_tensors = len(tensors)
-        if total_tensors > 0:
-            node_prefix = f"[{node_id}] " if node_id else ""
-            with ProgressTracker(total=total_tensors, desc=f"{node_prefix}Processing tensors") as convert_progress:
-                for key, tensor in tensors.items():
-                    # Component stripping
-                    if self._should_strip_key(key, strip_vae, strip_te, strip_clip, stripped_counts):
-                        convert_progress += 1
-                        continue
-                    # No key mapping — always ComfyUI original format
-                    new_key = key
-                    
-                    
-                    # Cast dtype if needed — keep on CPU (safetensors stores CPU bytes)
-                    if tensor.dtype != target_dtype:
-                        tensor = tensor.to(dtype=target_dtype)
-                    
-                    # Ensure contiguous for safetensors
-                    if not tensor.is_contiguous():
-                        tensor = tensor.contiguous()
-                    
-                    processed[new_key] = tensor
-                    convert_progress += 1
-        else:
-            print("⚠️ No tensors to process")
-        
-        timings['processing'] = time.time() - stage_start
-        stage_start = time.time()
+            if path.lower().endswith('.safetensors'):
+                if not save_trigger:
+                    return self._handle_file_preview(Path(path), _studio_kwargs, device)
+                return self._handle_file_save(Path(path), _studio_kwargs)
 
-        # ── Capture forensic data BEFORE freeing original tensors ──────────
-        _forensic_analysis = self._analyze_checkpoint_structure(tensors, target_dtype)
-        # Free original tensors — no longer needed after conversion.
-        # This recovers ~16 GB (fp16) before SVD / metadata / save / model-loading,
-        # eliminating the ~24 GB peak (tensors + processed coexist).
-        del tensors
-        cleanup_memory()
-        print(f"   ✅ Freed original tensors — {_forensic_analysis['total_size_gb']:.2f} GB recovered")
-
-        # Report stripping
-        if any(stripped_counts.values()):
-            print(f"🔪 Stripped components: VAE {stripped_counts['vae']}, TE {stripped_counts['te']}, CLIP {stripped_counts['clip']}")
-        
-        # Apply SVD compression if requested
-        svd_info = None
-        if svd_mode != "none":
-            print(f"🔧 Applying SVD compression ({svd_mode})...")
-            processed, svd_info = self._apply_svd_to_checkpoint(
-                processed, svd_mode, svd_energy_threshold,
-                target_device=target_device,
-            )
-            print(f"🔧 SVD compressed {svd_info['compressed_layers']} layers, saved {svd_info['size_saved_mb']:.2f} MB")
-        
-        if svd_mode != "none":
-            timings['svd'] = time.time() - stage_start
-            stage_start = time.time()
-
-        # Metadata handling via unified factory
-        mode = "preserve_a" if keep_metadata else "none"
-        extra = self._build_architecture_extra(_forensic_analysis['architecture'])
-        final_metadata = finalize_metadata(
-            metadata=metadata,
-            mode=mode,
-            component="checkpoint_studio",
-            extra_fields=extra,
-        )
-        
-        # Save if triggered
-        save_path = ""
-        if save_trigger:
-            try:
-                # Determine output path with auto-increment
-                output_path = self._resolve_output_path(save_folder, filename)
-                
-                # Save tensors and metadata using streaming write (avoids BytesIO 2x spike)
-                save_safetensors_stream(processed, output_path, metadata=final_metadata)
-                save_path = str(output_path)
-                print(f"💾 Saved to: {save_path}")
-            except Exception as e:
-                print(f"❌ Save failed: {e}")
-                save_path = ""
-        else:
-            print("🧠 Checkpoint kept in RAM, no file written")
-
-        # ── Post-conversion RAM summary ────────────────────────────────────
-        _avail = get_available_ram()
-        if _avail is not None:
-            print(f"   ✅ RAM post-conversion: {_avail / (1024**3):.2f} GB available")
-        
-        if save_trigger:
-            timings['saving'] = time.time() - stage_start
-            stage_start = time.time()
-
-        # Generate UI summary
-        quality_pct = self._estimate_quality_retention(target_dtype)
-        ui_summary = self._format_ui_summary(len(processed), target_dtype, quality_pct, stripped_counts, svd_info)
-        
-        # Generate forensic report from pre‑computed analysis (tensors already freed)
-        forensic_report = self._generate_forensic_report_from_analysis(
-            _forensic_analysis, processed, target_dtype, stripped_counts, svd_info
-        )
-        
-        # Return converted checkpoint (processed state dict)
-        converted_checkpoint = processed
-        
-        timings['model_loading'] = time.time() - stage_start
-        stage_start = time.time()
-
-        # Convert to MODEL/CLIP/VAE objects
-        output_vae = not strip_vae
-        output_clip = not (strip_te or strip_clip)
-        try:
-            model, clip, vae = load_state_dict_as_model_objects(
-                processed.copy(),  # preserve original for checkpoint_data output (ComfyUI pops keys)
-                metadata=final_metadata,
-                output_vae=output_vae,
-                output_clip=output_clip
-            )
-        except Exception as e:
-            print(f"⚠️ Failed to load state dict as model objects: {e}")
-            model, clip, vae = None, None, None
-        
-        total_time = time.time() - start_time
-        if debug:
-            print(f"⏱️  Performance timings:")
-            for stage, duration in timings.items():
-                print(f"   {stage}: {duration:.2f}s")
-            print(f"   total: {total_time:.2f}s")
-
-        return (converted_checkpoint, model, clip, vae, save_path, forensic_report)
+            return self._handle_non_safetensors_file(Path(path), _studio_kwargs)
 
 
 # Module-level alias for easy import from other engine modules

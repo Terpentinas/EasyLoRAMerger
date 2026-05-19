@@ -16,8 +16,10 @@ is unchanged: SmartBakingProcessor still lives in engine/baking_processor.py.
 """
 
 import torch
-import math
+import time
+_T0 = time.time()
 import statistics
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Set, Any
 from collections import Counter
 
@@ -27,6 +29,9 @@ from ..utils import (
     categorize_checkpoint_key,
     comfyui_yield,
     memory_optimized_merge,
+    get_available_ram,
+    cleanup_memory,
+    check_ram_guard,
 )
 from ..config import DevicePrecisionConfig
 
@@ -34,9 +39,21 @@ from ..config import DevicePrecisionConfig
 # Imports from sub-modules
 # =====================================================================
 
-# Delta reconstruction
+# Delta reconstruction — lazy and eager
 from .baking_processor_delta import (
     _reconstruct_lora_delta,
+    _LazyDeltaDict,
+    _MatchedDeltas,
+    _group_lora_pairs,
+    _ShapeInfo,
+)
+
+# FP8 quantizer — scale-then-cast, BF16 preservation, companion scales
+from .fp8_quantizer import (
+    quantize_to_fp8,
+    compute_weight_scale,
+    should_preserve_bf16,
+    quantize_weight_to_fp8_with_scales,
 )
 
 # Baking methods and assembly
@@ -51,6 +68,7 @@ from .baking_processor_baking import (
     bake_impact_weighted,
     bake_orthogonal,
     _assemble_output,
+    _assemble_output_lazy,
     _sanitize_or_revert,
     _sanitize_baked,
     _build_metadata,
@@ -120,6 +138,7 @@ class SmartBakingProcessor:
     _get_component_weight = staticmethod(_get_component_weight)
 
     _assemble_output = staticmethod(_assemble_output)
+    _assemble_output_lazy = staticmethod(_assemble_output_lazy)
     _sanitize_or_revert = staticmethod(_sanitize_or_revert)
     _sanitize_baked = staticmethod(_sanitize_baked)
     _build_metadata = staticmethod(_build_metadata)
@@ -179,8 +198,15 @@ class SmartBakingProcessor:
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, str], str, Dict[str, Any]]:
         """Early-abort return with error profile — preserves metadata/forensic shape."""
         print(f"❌ {error_msg}")
+        # CRITICAL: When ckpt_sd is a _LazyCheckpointMapping, dict(ckpt_sd) would
+        # trigger .items() which loads ALL tensors via mmap (17 GiB for Klein 9B).
+        # Return the lazy mapping as-is (no tensor data loaded) or an empty dict.
+        if hasattr(ckpt_sd, 'filepath'):
+            output_for_abort: Dict[str, torch.Tensor] = {}  # type: ignore[assignment]
+        else:
+            output_for_abort = dict(ckpt_sd)
         return (
-            dict(ckpt_sd),
+            output_for_abort,
             self._build_metadata(baking_method, strength,
                                  lora_source, checkpoint_name,
                                  0, len(ckpt_sd), original_metadata,
@@ -204,6 +230,7 @@ class SmartBakingProcessor:
         self,
         ckpt_sd: Dict[str, torch.Tensor],
         lora_sd: Dict[str, torch.Tensor],
+        ckpt_header: Optional[Dict[str, Any]] = None,
         baking_method: str = "linear",
         strength: float = 1.0,
         energy_concentration: float = 0.80,
@@ -216,6 +243,7 @@ class SmartBakingProcessor:
         weight_vae: float = 1.0,
         metadata_mode: str = "preserve_a",
         batch_size: int = 64,
+        detected_fp8: bool = False,
     ) -> Tuple[
         Dict[str, torch.Tensor],
         Dict[str, str],
@@ -226,8 +254,12 @@ class SmartBakingProcessor:
         Execute the full baking pipeline with per-component scaling.
 
         Args:
-            ckpt_sd: Source checkpoint state dict.
+            ckpt_sd: Source checkpoint state dict (can be _LazyCheckpointMapping).
             lora_sd: LoRA state dict to bake in.
+            ckpt_header: Optional safetensors header dict for mmap-based
+                         matching and lazy assembly. When provided, the
+                         pipeline avoids loading tensor data for key matching
+                         and assembles output as a lazy mapping.
             baking_method: "linear", "impact_weighted", or "orthogonal".
             strength: Overall baking strength multiplier.
             energy_concentration: Energy threshold for impact-weighted method.
@@ -240,6 +272,11 @@ class SmartBakingProcessor:
             weight_vae: Per-component weight for VAE keys.
             metadata_mode: "none" (baking only), "preserve_a" (original priority),
                            or "merge_basic" (baking priority).
+            detected_fp8: When True, the checkpoint has FP8 native weights.
+                          Computation is performed in bfloat16 (via Fix 1 in
+                          _safe_bake_add) and stale FP8 scale keys are stripped
+                          from the output.  Preserved (non-baked) keys are
+                          auto-converted from FP8 to bfloat16 on access.
 
         Returns:
             output_sd:      Final assembled state dict with baked weights
@@ -247,6 +284,14 @@ class SmartBakingProcessor:
             forensic_report: Human-readable forensic report string (Lora Studio style)
             impact_profile:  Dict with impact analysis details
         """
+        # Detect if ckpt_sd is a lazy mapping (has .filepath attribute)
+        # _LazyCheckpointMapping from musubi_checkpoint_studio.py stores the
+        # original file path, enabling lazy assembly without a separate path arg.
+        self._lazy_mode = hasattr(ckpt_sd, 'filepath')
+        self._ckpt_path = getattr(ckpt_sd, 'filepath', None)
+        # 🔥 FP8: Store detection flag for assembly pass-through
+        self._detected_fp8 = detected_fp8
+
         with memory_optimized_merge():
             # Step 2a: SD1.5 Diffusers Bridge detection
             use_diffusers_bridge = False
@@ -258,6 +303,10 @@ class SmartBakingProcessor:
 
             print("\n" + "=" * 50)
             print("🔥 Easy LoRA Baker — Baking Pipeline")
+            precision_info = (f"(compute uses float16 fallback)"
+                              if self.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                              else "")
+            print(f"   🎯 Precision: {self.dtype} {precision_info}")
             print("=" * 50)
 
             # =====================================================================
@@ -284,10 +333,18 @@ class SmartBakingProcessor:
 
             pipeline_progress += 1  # Phase 1: Normalization done
 
-            # Step 3: Reconstruct deltas (alpha/rank scaling applied inside)
-            # Use GPU for matmul if device is CUDA (respects user's auto/cuda/cpu choice)
+            # Step 3: Group LoRA pairs for on-demand delta reconstruction
+            # Instead of reconstructing all ≈112 deltas upfront (≈9.6 GB), store only
+            # the A/B component tensors (≈14 MB) and reconstruct each delta on demand
+            # during matching (shape inference) and baking (.pop() → one at a time).
+            #
+            # GPU acceleration: if CUDA is available, the A/B tensors are moved to GPU
+            # during _reconstruct_one() inside _LazyDeltaDict.reconstruct(), keeping the
+            # fast matmul path while avoiding VRAM accumulation since only one delta
+            # is reconstructed at a time.
             device_for_reconstruction = self.device if 'cuda' in str(self.device) else None
-            lora_deltas = self._reconstruct_lora_delta(lora_sd, device=device_for_reconstruction)
+            lora_pairs, lora_standalone = _group_lora_pairs(lora_sd)
+            lora_deltas = _LazyDeltaDict(lora_pairs, lora_standalone, device=device_for_reconstruction)
 
             if not lora_deltas:
                 return self._abort_bake(
@@ -322,7 +379,11 @@ class SmartBakingProcessor:
                   f"CLIP: {clip_count} keys, VAE: {vae_count} keys, Other: {other_count} keys")
             if self._verbose:
                 for i, (base, delta) in enumerate(sorted(lora_deltas.items())):
-                    print(f"      [{i:>3d}] {str(base):>70s} shape={str(list(delta.shape)):>20s} norm={torch.norm(delta.float()).item():.4f}")
+                    if isinstance(delta, _ShapeInfo):
+                        norm_str = "N/A (lazy)"
+                    else:
+                        norm_str = f"{torch.norm(delta.float()).item():.4f}"
+                    print(f"      [{i:>3d}] {str(base):>70s} shape={str(list(delta.shape)):>20s} norm={norm_str}")
 
             comfyui_yield()
             pipeline_progress += 1  # Phase 2: Delta reconstruction done
@@ -337,19 +398,16 @@ class SmartBakingProcessor:
                 print(f"      diffusers_bridge_1:1: {len(matched_deltas)} keys")
             else:
                 matched_deltas, match_stats = self._find_matching_keys(
-                    ckpt_sd, lora_deltas, return_stats=True
+                    ckpt_sd, lora_deltas, return_stats=True,
+                    ckpt_header=ckpt_header,
                 )
                 # Log match strategy distribution
                 if match_stats:
                     print(f"\n   📊 Match strategy distribution ({sum(match_stats.values())} total):")
                     for strategy, count in sorted(match_stats.items(), key=lambda x: -x[1]):
                         print(f"      {strategy}: {count} keys")
-            # Move matched delta tensors to target device (only if not already there)
-            if matched_deltas:
-                sample = next(iter(matched_deltas.values()))
-                if sample.device != self.device:
-                    matched_deltas = {k: v.to(device=self.device)
-                                      for k, v in matched_deltas.items()}
+            # NOTE: matched_deltas stay on CPU — moved to GPU on-demand per-key
+            # inside _prepare_bake_key / each bake method's inner loop.
             if not matched_deltas:
                 return self._abort_bake(
                     "No keys matched between LoRA and checkpoint — aborting bake",
@@ -374,18 +432,58 @@ class SmartBakingProcessor:
                 bake_fn = self.bake_linear
                 baking_method = "linear"
 
+            # ── RAM Guard: per-batch GPU memory guard ──
+            if matched_deltas and ckpt_header is not None:
+                sample_delta = next(iter(matched_deltas.values()))
+                per_key_bytes = sample_delta.numel() * sample_delta.element_size() * 3
+                batch_peak = per_key_bytes * batch_size
+                _avail_ram = get_available_ram()
+                if _avail_ram is not None:
+                    _ram_gb = _avail_ram / (1024**3)
+                    _peak_gb = batch_peak / (1024**3)
+                    print(f"🧠 RAM Guard (baking): Estimated peak ~{_peak_gb:.2f} GB/batch, "
+                          f"Available RAM ~{_ram_gb:.2f} GB, "
+                          f"85% threshold ~{_ram_gb * 0.85:.2f} GB")
+                    if batch_peak > _avail_ram * 0.85:
+                        old_bs = batch_size
+                        batch_size = 1
+                        print(f"   ⚠️ Batch size {old_bs} exceeds RAM threshold — "
+                              f"falling back to sequential (batch_size=1)")
+                    else:
+                        print(f"✅ RAM Guard (baking): Batch size {batch_size} within safe limits")
+                else:
+                    print(f"⚠️ RAM Guard (baking): Cannot detect available RAM — proceeding")
+
+            # Initialize output dict (always dict mode — streaming path removed)
+            output_dict: Dict[str, torch.Tensor] = {}
+
             if baking_method == "impact_weighted":
-                baked = bake_fn(
-                    ckpt_sd, matched_deltas, strength, energy_concentration,
+                delta_norms, delta_ratios = bake_fn(
+                    ckpt_sd, matched_deltas, output_dict, strength, energy_concentration,
                     weight_unet, weight_te, weight_clip, weight_vae,
                     batch_size=batch_size,
                 )
             else:
-                baked = bake_fn(
-                    ckpt_sd, matched_deltas, strength,
+                delta_norms, delta_ratios = bake_fn(
+                    ckpt_sd, matched_deltas, output_dict, strength,
                     weight_unet, weight_te, weight_clip, weight_vae,
                     batch_size=batch_size,
                 )
+
+            # Capture matched count before deletion
+            _matched_count = len(matched_deltas) if matched_deltas is not None else 0
+
+            # matched_deltas and lora_deltas are no longer needed after baking.
+            # In lazy mode, _MatchedDeltas is a thin wrapper (few KB) and
+            # _LazyDeltaDict holds only component tensors (≈14 MB for 112 pairs).
+            # Delete eagerly to free residual memory (Fix #6).
+            del matched_deltas, lora_deltas
+            cleanup_memory()
+            comfyui_yield()
+
+
+            # Alias output_dict as baked for minimal downstream changes
+            baked = output_dict
 
             # =====================================================================
             # COMPONENT BAKED COUNTING: Count how many keys per component were baked
@@ -425,40 +523,10 @@ class SmartBakingProcessor:
                         print(f"        - {key}: {reason}")
 
             # =====================================================================
-            # DELTA STATISTICS: Collect per-layer norms and ratios for forensic analysis
+            # DELTA STATISTICS: Use norms/ratios collected during bake loop
             # =====================================================================
             print("\n" + "-" * 50)
             print("📊 DELTA STATISTICS (aggregate across all baked keys):")
-            delta_norms: List[float] = []
-            delta_ratios: List[float] = []
-            base_norms: List[float] = []
-            for ckpt_key in baked:
-                if ckpt_key not in ckpt_sd:
-                    continue
-                delta = matched_deltas.get(ckpt_key)
-                if delta is None:
-                    continue
-                base = ckpt_sd[ckpt_key]
-                try:
-                    delta_adjusted = self._align_delta_shape(delta, base)
-                except ValueError as e:
-                    print(f"      ⚠️ Skipping delta stats for {ckpt_key}: {e}")
-                    continue
-                comp_weight = self._get_component_weight(
-                    ckpt_key, weight_unet, weight_te, weight_clip, weight_vae
-                )
-                if comp_weight == 0.0:
-                    continue
-                dn = torch.norm(delta_adjusted.float()).item()
-                bn = torch.norm(base.float()).item()
-                # Skip NaN/Inf values — they corrupt statistics computation
-                if not math.isfinite(dn) or not math.isfinite(bn):
-                    continue
-                delta_norms.append(dn)
-                base_norms.append(bn)
-                delta_ratios.append(dn / max(bn, 1e-12))
-
-            comfyui_yield()
 
             if delta_norms:
                 mean_dn = statistics.mean(delta_norms)
@@ -504,21 +572,161 @@ class SmartBakingProcessor:
             print("-" * 50)
             pipeline_progress += 1  # Phase 4: Baking + statistics done
 
+            # =====================================================================
+            # 🔍 BAKE VERIFICATION: Sample-check baked weights differ from original
+            # =====================================================================
+            if baked and ckpt_sd:
+                _verify_keys = list(baked.keys())[:3]
+                _all_differ = True
+                for _vk in _verify_keys:
+                    if _vk in ckpt_sd:
+                        _orig = ckpt_sd[_vk]
+                        _baked_t = baked[_vk]
+                        if isinstance(_orig, torch.Tensor) and isinstance(_baked_t, torch.Tensor):
+                            if _orig.shape == _baked_t.shape:
+                                _diff = (_baked_t.to(dtype=torch.float32) - _orig.to(dtype=torch.float32)).abs().max().item()
+                                _dtype_match = "✅" if _baked_t.dtype == _orig.dtype else f"⚠️ dtype: {_baked_t.dtype}≠{_orig.dtype}"
+                                print(f"   🔍 Bake verify '{_vk[:60]}...': |diff|_max={_diff:.6e} {_dtype_match}")
+                                if _diff == 0.0:
+                                    _all_differ = False
+                            else:
+                                print(f"   🔍 Bake verify '{_vk[:60]}...': shape mismatch {_baked_t.shape}≠{_orig.shape}")
+                                _all_differ = False
+                        else:
+                            print(f"   🔍 Bake verify '{_vk[:60]}...': non-tensor type")
+                            _all_differ = False
+                if _all_differ and _verify_keys:
+                    print(f"   ✅ Bake verification passed — sampled weights differ from originals")
+                elif _verify_keys:
+                    print(f"   ⚠️ Bake verification: some sampled weights match originals (delta=0)")
+            else:
+                print(f"   ⚠️ Bake verification: no baked keys to verify")
+
             # NaN/Inf sanitization
             # 🔥 REVERT-TO-ORIGINAL: Pass ckpt_sd so any key with persistent NaN/Inf
             # reverts to its original checkpoint weight instead of being replaced
             # with zeros (which cause black/dark patches in generated images).
             baked = self._sanitize_baked(baked, original_ckpt_sd=ckpt_sd)
 
-            # Step 8: Assemble with VAE pass-through
-            output_sd = self._assemble_output(ckpt_sd, baked)
+            # Close mmap handles if ckpt_sd is a lazy mapping (Fix #4).
+            # After sanitize, we no longer need to read from the original checkpoint.
+            # The lazy assembly step creates a new mapping from self._ckpt_path instead.
+            if hasattr(ckpt_sd, 'close'):
+                ckpt_sd.close()
 
-            # Build impact profile
+            # ── Measure pre-assembly RAM ──
+            _pre_assembly_ram = get_available_ram()
+            print(f"   🕐 [t={time.time()-_T0:.1f}s] Starting output assembly (_assemble_output_lazy)")
+
+            # Step 8: Assemble output — always lazy when checkpoint is mmap'd.
+            # _assemble_output_lazy creates a _LazyCheckpointMapping with baked keys
+            # in the write cache. Non-baked keys stay mmap'd from the original file —
+            # zero bytes copied. Compatible with both preview mode
+            # (load_state_dict_as_model_objects) and save mode
+            # (materialize via dict(items()) then save_safetensors_stream).
+            if self._lazy_mode:
+                if self._ckpt_path is not None and ckpt_header is not None:
+                    _user_fp8 = (
+                        self.dtype
+                        if self.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                        else None
+                    )
+                    output_sd = _assemble_output_lazy(
+                        self._ckpt_path, ckpt_header, baked,
+                        detected_fp8=self._detected_fp8,
+                        user_fp8_dtype=_user_fp8,
+                    )
+                else:
+                    raise RuntimeError(
+                        "Lazy assembly requires both ckpt_path and ckpt_header. "
+                        "Cannot fall back to eager assembly — would load 17+ GiB into RAM."
+                    )
+            else:
+                output_sd = self._assemble_output(
+                    ckpt_sd, baked,
+                    fp8_dequantized=self._detected_fp8,
+                    target_dtype=self.dtype,
+                )
+
+            # Free the baked dict — its CPU tensors are now held by output_sd
+            # (or the lazy mapping's write cache). Reclaim the dict wrapper + any
+            # stale references eagerly so cleanup_memory() can free residual GPU pages.
+            # NOTE: Keep `baked` alive until all downstream uses (impact_profile,
+            # metadata, forensic report, final print) are done.
+            # Convert per-key count to local variables first for safe deletion later.
+            _baked_count = len(baked)
+            cleanup_memory()
+            comfyui_yield()
+
+            # ── Measure post-assembly RAM and print delta ──
+            _post_assembly_ram = get_available_ram()
+            if _pre_assembly_ram is not None and _post_assembly_ram is not None:
+                _delta_gb = (_pre_assembly_ram - _post_assembly_ram) / (1024**3)
+                print(f"📊 RAM: Pre-assembly {_pre_assembly_ram / (1024**3):.2f} GB → "
+                      f"Post-assembly {_post_assembly_ram / (1024**3):.2f} GB "
+                      f"(delta: {_delta_gb:+.2f} GB)")
+            elif _post_assembly_ram is not None:
+                print(f"📊 Post-assembly available RAM: {_post_assembly_ram / (1024**3):.2f} GB")
+            cleanup_memory()
+            print(f"   🕐 [t={time.time()-_T0:.1f}s] Output assembly complete — {len(output_sd)} keys in output_sd")
+
+            # =====================================================================
+            # 🔍 DIAGNOSTIC: Validate baked keys match checkpoint key format
+            # =====================================================================
+            # After the Section 4d/4e fix in _build_reverse_key_map(), all Flux Klein
+            # LoRA keys match via reverse_map (Strategy 0) instead of shape_block
+            # (Strategy 4). This diagnostic verifies:
+            #   1. Baked keys use checkpoint-native prefix
+            #      - Vanilla Flux: transformer.*
+            #      - Klein Flux:   double_blocks.* / single_blocks.* (bare)
+            #   2. The strategy distribution shows 0 shape_block keys for Flux
+            #   3. ComfyUI's "left over keys" in Flux model loading is NORMAL —
+            #      ComfyUI internally strips prefixes during loading
+            if baked and ckpt_sd:
+                # Check if this is a Flux checkpoint
+                _ckpt_sample_keys = list(ckpt_sd.keys())[:5]
+                _is_flux = any(
+                    k.startswith(('transformer.', 'double_blocks.', 'single_blocks.'))
+                    for k in _ckpt_sample_keys
+                )
+                if _is_flux:
+                    # Detect checkpoint key prefix style
+                    _has_transformer = any(k.startswith('transformer.') for k in _ckpt_sample_keys)
+                    _has_bare_blocks = any(
+                        k.startswith(('double_blocks.', 'single_blocks.'))
+                        for k in _ckpt_sample_keys
+                    )
+                    _expected_prefix = 'transformer.' if _has_transformer else 'double_blocks./single_blocks.'
+                    
+                    # Verify baked keys use correct prefix
+                    if _has_transformer:
+                        _all_proper_prefix = all(k.startswith('transformer.') for k in baked.keys())
+                    else:
+                        _all_proper_prefix = all(
+                            k.startswith(('double_blocks.', 'single_blocks.'))
+                            for k in baked.keys()
+                        )
+                    
+                    if _all_proper_prefix:
+                        print(f"   ✅ Baked key format: all {len(baked)} keys use "
+                              f"'{_expected_prefix}' prefix — correct for Flux model loader")
+                        print(f"      (ComfyUI's Flux loader strips prefixes internally;")
+                        print(f"       'left over keys' in logs is NORMAL behavior — weights ARE consumed)")
+                    else:
+                        _wrong_prefix = [k for k in baked.keys()
+                                         if _has_transformer and not k.startswith('transformer.')
+                                         or not _has_transformer and not k.startswith(('double_blocks.', 'single_blocks.'))]
+                        print(f"   ⚠️  {len(_wrong_prefix)} baked keys with unexpected prefix:")
+                        for _nk in _wrong_prefix[:3]:
+                            print(f"      - {_nk}")
+                        print(f"      These may NOT be consumed by ComfyUI's Flux model loader!")
+
+            # Build impact profile (use captured lengths — baked still alive here)
             impact_profile = {
                 "baking_method": baking_method,
-                "matched_keys": len(matched_deltas),
-                "baked_keys": len(baked),
-                "preserved_keys": len(ckpt_sd) - len(baked),
+                "matched_keys": _matched_count,
+                "baked_keys": _baked_count,
+                "preserved_keys": len(ckpt_sd) - _baked_count,
                 "total_keys": len(ckpt_sd),
                 "strength": strength,
                 "weight_unet": weight_unet,
@@ -531,7 +739,7 @@ class SmartBakingProcessor:
             metadata = self._build_metadata(
                 baking_method, strength,
                 lora_source, checkpoint_name,
-                len(baked), len(ckpt_sd) - len(baked),
+                _baked_count, len(ckpt_sd) - _baked_count,
                 original_metadata,
                 weight_unet, weight_te, weight_clip, weight_vae,
                 metadata_mode,
@@ -541,7 +749,7 @@ class SmartBakingProcessor:
             forensic_report = self._build_forensic_report(
                 baking_method, strength,
                 lora_source, checkpoint_name,
-                len(baked), len(ckpt_sd) - len(baked),
+                _baked_count, len(ckpt_sd) - _baked_count,
                 len(ckpt_sd), impact_profile,
                 weight_unet=weight_unet, weight_te=weight_te,
                 weight_clip=weight_clip, weight_vae=weight_vae,
@@ -551,11 +759,16 @@ class SmartBakingProcessor:
 
             print("=" * 50)
             print("✅ Baking pipeline complete!")
-            print(f"   Baked {len(baked)} keys, preserved {len(ckpt_sd) - len(baked)} keys")
+            print(f"   Baked {_baked_count} keys, preserved {len(ckpt_sd) - _baked_count} keys")
             print(f"   🧱 Weights — UNet:{weight_unet} TE:{weight_te} CLIP:{weight_clip} VAE:{weight_vae}")
             print(f"   📋 Metadata mode: {metadata_mode}")
             print("=" * 50)
             pipeline_progress += 1  # Phase 5: Assembly + metadata done
             pipeline_progress.complete()
 
+            # Free the baked dict now that all uses are done.
+            del baked
+            cleanup_memory()
+
+            print(f"   🕐 [t={time.time()-_T0:.1f}s] SmartBakingProcessor.bake returning")
             return output_sd, metadata, forensic_report, impact_profile

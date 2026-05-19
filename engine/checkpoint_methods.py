@@ -9,6 +9,7 @@ while eliminating ~700 lines of duplicated merge function bodies.
 
 import gc
 import math
+import time
 from typing import List, Dict, Optional, Tuple, Callable
 
 import torch
@@ -218,7 +219,8 @@ def merge_triple_method(sds: List[Dict[str, torch.Tensor]],
                         metas: Optional[List[Dict[str, str]]] = None,
                         on_substep: Optional[Callable[[int], None]] = None,
                         resolved_device: Optional[torch.device] = None,
-                        resolved_dtype: Optional[torch.dtype] = None) -> Tuple[Dict[str, torch.Tensor], List[str]]:
+                        resolved_dtype: Optional[torch.dtype] = None,
+                        sequential_only: bool = False) -> Tuple[Dict[str, torch.Tensor], List[str]]:
     """
     Core triple merge logic for checkpoints with component scaling (Weight Block Map).
 
@@ -320,6 +322,8 @@ def merge_triple_method(sds: List[Dict[str, torch.Tensor]],
     else:
         device = DeviceManager.get_device(device)
     merged = {}
+    _mt_t0 = time.time()
+    print(f"   🕐 [t={0.0:.1f}s] merge_triple_method: starting with {len(sds)} sources, method={method}")
 
     # Convert to list for deterministic ordering
     key_list = list(all_keys)
@@ -368,18 +372,19 @@ def merge_triple_method(sds: List[Dict[str, torch.Tensor]],
             sequential_key_list.extend(keys)
     # Free intermediate structure — no longer needed after batching setup
     del shape_to_keys
+    print(f"   🕐 [t={time.time()-_mt_t0:.1f}s] merge_triple_method: shape-batch distribution complete ({len(batchable_shapes)} groups, {len(sequential_key_list)} sequential)")
 
     # ── VRAM check: only batch if the largest group fits ───────────────
     batching_enabled = False
-    if batchable_shapes and device.type == 'cuda' and method not in BATCH_INCOMPATIBLE_METHODS:
+    if not sequential_only and batchable_shapes and device.type == 'cuda' and method not in BATCH_INCOMPATIBLE_METHODS:
         largest_shape, largest_keys = max(
             batchable_shapes.items(),
             key=lambda x: x[0].numel() * len(x[1])
         )
         # Method-specific safety factors for stacked tensor intermediates.
         # Different merge methods create vastly different intermediate tensor sizes:
-        # - default 3: element-wise ops (linear, subtract, dare_*, etc.) create
-        #   ~1-2 temporary copies of input — peak ~3-4× stacked input
+        # - default 2: element-wise ops (linear, subtract, dare_*, ties_*) create
+        #   only ~1 temporary copy of input — peak ~2× stacked input
         # - feature_mix 6: creates [3, batch, ...] intermediates (magnitudes,
         #   shares) plus int64 dominant_idx (4× per element) — peak ~16× stacked
         # - svd_preserve 6: float32 copies (4× bf16) + batched SVD U/S/Vh
@@ -392,13 +397,24 @@ def merge_triple_method(sds: List[Dict[str, torch.Tensor]],
             "magnitude": 4,
             "gradient_alignment": 4,
         }
-        safety_factor = _METHOD_SAFETY_FACTORS.get(method, 3)
+        base_factor = _METHOD_SAFETY_FACTORS.get(method, 2)
+        # Active blend mode creates up to 10 boolean masks via _compute_active_masks()
+        # (same shape as stacked input) plus _weight_tensors() creates 3 weighted copies.
+        # These are NOT accounted for by the base safety factor (which only covers
+        # merge-method-specific intermediates), so we add a flat +2 penalty so the VRAM
+        # estimate correctly reflects the actual peak memory usage of active-blend merges.
+        blend_penalty = 2 if blend_mode == 'active' else 0
+        safety_factor = base_factor + blend_penalty
 
         # Stacked tensors + method-specific intermediates estimate.
-        # Note: source tensors are on CPU (loaded via safe_open), not GPU.
-        # Their GPU footprint is the stacked tensors themselves, already
-        # captured by stacked_bytes.
-        stacked_bytes = 3 * len(largest_keys) * largest_shape.numel() * 2 * safety_factor
+        # Source tensors are on CPU (loaded via safe_open), not GPU prior to this.
+        # The stacked source tensors ARE the GPU footprint — they replace per-key
+        # individual tensors that would otherwise be loaded one-at-a-time in
+        # sequential mode.  Merge intermediates add safety_factor × stacked size.
+        # Use the actual number of active sources (not hardcoded 3) so two-way
+        # merges get a realistic estimate.
+        num_sources = len(sds)
+        stacked_bytes = num_sources * len(largest_keys) * largest_shape.numel() * 2 * safety_factor
         est_bytes = stacked_bytes
 
         # Compute actual available VRAM as total - current_allocated.
@@ -407,11 +423,18 @@ def merge_triple_method(sds: List[Dict[str, torch.Tensor]],
         total_memory = torch.cuda.get_device_properties(device).total_memory
         current_allocated = torch.cuda.memory_allocated(device)
         free_vram = total_memory - current_allocated
-        # Safety margin: only batch if total estimated need < 80% of total VRAM.
-        # This accounts for fragmentation and the fact that stacked_bytes is a
-        # lower bound (actual merge intermediates can be significantly larger).
-        safe_threshold = int(total_memory * 0.80)
-        if free_vram > 0 and current_allocated + est_bytes < safe_threshold:
+        # Safety margin: only batch if stacked+intermediates fit within free VRAM.
+        # We compare est_bytes directly against free_vram (NOT current_allocated +
+        # est_bytes) because the stacked source tensors REPLACE per-key GPU tensors
+        # that sequential mode would load anyway — there's no additive cost for the
+        # source data itself; only the merge intermediates are extra.
+        # Using free_vram × 50% gives headroom for merge intermediates that
+        # briefly spike during the merge_fn call (temp1 + temp2 + result can
+        # temporarily reach 3-4× the stacked source size before Python's
+        # reference counting deallocates the temporaries).
+        # Previously 80% — caused CUDA OOM on large shape groups because
+        # cp_buffers (now freed) and merge intermediate spikes were unaccounted.
+        if free_vram > 0 and est_bytes < free_vram * 0.5:
             batching_enabled = True
             shape_str = '×'.join(str(d) for d in largest_shape)
             print(f"   🚀 Shape batching enabled: {len(batchable_shapes)} groups, "
@@ -419,13 +442,13 @@ def merge_triple_method(sds: List[Dict[str, torch.Tensor]],
                   f"(~{est_bytes / 1e9:.2f} GB est, "
                   f"{current_allocated / 1e9:.2f} GB allocated, "
                   f"{free_vram / 1e9:.2f} GB free, "
-                  f"within 80% threshold)")
+                  f"within 50% threshold)")
         else:
             shape_str = '×'.join(str(d) for d in largest_shape)
-            pct = 100.0 * (current_allocated + est_bytes) / total_memory
+            pct = 100.0 * est_bytes / free_vram if free_vram > 0 else float('inf')
             print(f"   ℹ️ Shape batching skipped: "
-                  f"~{est_bytes / 1e9:.2f} GB est + {current_allocated / 1e9:.2f} GB allocated "
-                  f"= {pct:.0f}% of total VRAM (80% threshold) "
+                  f"~{est_bytes / 1e9:.2f} GB est would use {pct:.0f}% of "
+                  f"{free_vram / 1e9:.2f} GB free VRAM (50% threshold) "
                   f"— falling back to sequential")
 
     # ── Shared merge helpers ───────────────────────────────────────────
@@ -542,53 +565,114 @@ def merge_triple_method(sds: List[Dict[str, torch.Tensor]],
             memory_guard()
 
             # Per-checkpoint collections for this shape group
-            cp_buffers: List[List[torch.Tensor]] = [[], [], []]
-            cp_weight_vals: List[List[float]] = [[], [], []]
+            # Dynamically sized to match the actual number of sources (may be 2
+            # or 3 for two-way / three-way merge).  Previously hardcoded to 3
+            # slots, which was safe only because unused slots remained empty.
+            num_sources = len(sds)
+            cp_buffers: List[List[torch.Tensor]] = [[] for _ in range(num_sources)]
+            cp_weight_vals: List[List[float]] = [[] for _ in range(num_sources)]
             batch_keys: List[str] = []
 
-            for key in keys:
-                collected_t: List[torch.Tensor] = []
-                collected_w: List[float] = []
-                skip_key = False
-                for i, sd in enumerate(sds):
-                    if key in sd:
-                        t = sd[key]
-                        t_bytes = t.numel() * t.element_size()
-                        if t_bytes > MAX_TENSOR_BYTES:
-                            print(f"   ⚠️ Corrupt tensor '{key}' in source {i}: "
-                                  f"{t_bytes / (1024**3):.2f} GB exceeds "
-                                  f"{MAX_TENSOR_BYTES / (1024**3):.0f} GB limit – skipping")
-                            if key not in corrupted_keys:
-                                corrupted_keys.append(key)
-                            skip_key = True
-                            break
-                        # Guard redundant .to() calls — no-op on correct device/dtype
-                        if t.device != device:
-                            t = t.to(device)
-                        t = _ensure_compute_dtype(t, resolved_dtype)
-                        collected_t.append(t)
-                        collected_w.append(weights[i])
+            # ── Load per-key tensors to GPU ───────────────────────
+            # try/except catches CUDA OOM during .to(device) for large shape
+            # groups (e.g. 24576×4096 × 4 keys in Flux).  Previous OOMs at this
+            # stage propagated to the weave-level handler, forcing ALL subsequent
+            # batches to CPU sequential.  Now we catch per-group and fall back to
+            # per-key sequential on CPU for just this shape group.
+            try:
+                for key in keys:
+                    collected_t: List[torch.Tensor] = []
+                    collected_w: List[float] = []
+                    skip_key = False
+                    for i, sd in enumerate(sds):
+                        if key in sd:
+                            t = sd[key]
+                            t_bytes = t.numel() * t.element_size()
+                            if t_bytes > MAX_TENSOR_BYTES:
+                                print(f"   ⚠️ Corrupt tensor '{key}' in source {i}: "
+                                      f"{t_bytes / (1024**3):.2f} GB exceeds "
+                                      f"{MAX_TENSOR_BYTES / (1024**3):.0f} GB limit – skipping")
+                                if key not in corrupted_keys:
+                                    corrupted_keys.append(key)
+                                skip_key = True
+                                break
+                            # Guard redundant .to() calls — no-op on correct device/dtype
+                            if t.device != device:
+                                t = t.to(device)
+                            t = _ensure_compute_dtype(t, resolved_dtype)
+                            collected_t.append(t)
+                            collected_w.append(weights[i])
 
-                if skip_key:
-                    if on_substep:
-                        on_substep(1)
+                    if skip_key:
+                        if on_substep:
+                            on_substep(1)
+                        continue
+
+                    if len(collected_t) < 2:
+                        # Unique key — process individually
+                        if collected_t:
+                            scaled = apply_component_scaling(
+                                collected_t[0], key,
+                                weight_unet, weight_clip, weight_vae, weight_te)
+                            merged[key] = (scaled * collected_w[0]).cpu()
+                        if on_substep:
+                            on_substep(1)
+                        continue
+
+                    batch_keys.append(key)
+                    for idx, (t, w) in enumerate(zip(collected_t, collected_w)):
+                        cp_buffers[idx].append(t)
+                        cp_weight_vals[idx].append(w)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if isinstance(e, torch.cuda.OutOfMemoryError) or "CUDA out of memory" in str(e):
+                    print(f"   ⚠️ CUDA OOM loading keys for shape {shape} — per-key CPU fallback")
+                    # Clean up partially-loaded GPU tensors in cp_buffers
+                    del cp_buffers
+                    del cp_weight_vals
+                    gc.collect()
+                    torch.cuda.empty_cache()
+                    # Process all keys in this shape group individually.
+                    # Tensors in sds are still on CPU (the failed .to(device)
+                    # left them there), so we pass CPU tensors to
+                    # _process_single_key which handles GPU transfer per-key.
+                    for key in keys:
+                        t_list = []
+                        w_list = []
+                        corrupt = False
+                        for i, sd in enumerate(sds):
+                            if key in sd:
+                                t = sd[key]
+                                t_bytes = t.numel() * t.element_size()
+                                if t_bytes > MAX_TENSOR_BYTES:
+                                    if key not in corrupted_keys:
+                                        corrupted_keys.append(key)
+                                    corrupt = True
+                                    break
+                                t = _ensure_compute_dtype(t, resolved_dtype)
+                                t_list.append(t)
+                                w_list.append(weights[i])
+                        if corrupt:
+                            if on_substep:
+                                on_substep(1)
+                            continue
+                        if len(t_list) >= 2:
+                            result = _process_single_key(key, t_list, w_list)
+                            result = _apply_density(result, key)
+                            merged[key] = result.cpu()
+                        elif len(t_list) == 1:
+                            scaled = apply_component_scaling(
+                                t_list[0], key,
+                                weight_unet, weight_clip, weight_vae, weight_te)
+                            merged[key] = (scaled * w_list[0]).cpu()
+                        # Free source tensor references after processing
+                        for sd in sds:
+                            sd.pop(key, None)
+                        if on_substep:
+                            on_substep(1)
+                    cleanup_memory()
                     continue
-
-                if len(collected_t) < 2:
-                    # Unique key — process individually
-                    if collected_t:
-                        scaled = apply_component_scaling(
-                            collected_t[0], key,
-                            weight_unet, weight_clip, weight_vae, weight_te)
-                        merged[key] = (scaled * collected_w[0]).cpu()
-                    if on_substep:
-                        on_substep(1)
-                    continue
-
-                batch_keys.append(key)
-                for idx, (t, w) in enumerate(zip(collected_t, collected_w)):
-                    cp_buffers[idx].append(t)
-                    cp_weight_vals[idx].append(w)
+                else:
+                    raise
 
             if len(batch_keys) < MIN_BATCH_SHAPE_GROUP_SIZE:
                 # Not enough for efficient batching — process individually
@@ -634,106 +718,143 @@ def merge_triple_method(sds: List[Dict[str, torch.Tensor]],
                 continue
 
             # ── Stack tensors per-checkpoint: [batch, rows, cols] ──
-            stacked_cp: List[torch.Tensor] = []
-            stacked_cp_weights: List[float] = []
-            for cp_idx in range(3):
-                if cp_buffers[cp_idx]:
-                    stacked_cp.append(
-                        torch.stack(cp_buffers[cp_idx], dim=0))
-                    # All keys share the same checkpoint weight
-                    stacked_cp_weights.append(cp_weight_vals[cp_idx][0])
-
-            if len(stacked_cp) < 2:
-                # Not enough sources for batched merge — process individually
-                # to avoid dropping unique keys (e.g. position embeddings
-                # present in only 1 checkpoint).
-                for ki, key in enumerate(batch_keys):
-                    t_list = [cb[ki] for cb in cp_buffers if ki < len(cb)]
-                    w_list = [cw[ki] for cw in cp_weight_vals if ki < len(cw)]
-                    if len(t_list) >= 2:
-                        result = _process_single_key(key, t_list, w_list)
-                        result = _apply_density(result, key)
-                        merged[key] = result.cpu()
-                    elif len(t_list) == 1:
-                        # Single-source key: component-scale and weight
-                        scaled = apply_component_scaling(
-                            t_list[0], key,
-                            weight_unet, weight_clip, weight_vae, weight_te)
-                        merged[key] = (scaled * w_list[0]).cpu()
-                    if on_substep:
-                        on_substep(1)
-                continue
-
-            # Component scaling — verify all keys belong to same component
-            rep_key = batch_keys[0]
-            rep_category = categorize_key(rep_key)
-            all_same_comp = all(categorize_key(k) == rep_category for k in batch_keys)
-            if not all_same_comp:
-                # Mixed-component group — fall back to per-key processing
-                for ki, key in enumerate(batch_keys):
-                    t_list = [cb[ki] for cb in cp_buffers if ki < len(cb)]
-                    w_list = [cw[ki] for cw in cp_weight_vals if ki < len(cw)]
-                    if len(t_list) >= 2:
-                        result = _process_single_key(key, t_list, w_list)
-                        result = _apply_density(result, key)
-                        merged[key] = result.cpu()
-                    elif len(t_list) == 1:
-                        # Single-source key: component-scale and weight
-                        scaled = apply_component_scaling(
-                            t_list[0], key,
-                            weight_unet, weight_clip, weight_vae, weight_te)
-                        merged[key] = (scaled * w_list[0]).cpu()
-                    if on_substep:
-                        on_substep(1)
-                continue
-            # All same component — proceed with batched scaling
-            for idx in range(len(stacked_cp)):
-                stacked_cp[idx] = apply_component_scaling(
-                    stacked_cp[idx], rep_key,
-                    weight_unet, weight_clip, weight_vae, weight_te)
-
-            # Magnitude equalization
-            if magnitude_scaling != "none" and len(stacked_cp) >= 2:
-                orig_indices = [i for i, sd in enumerate(sds)
-                                if rep_key in sd]
-                if 0 in orig_indices:
-                    ref_idx = orig_indices.index(0)
-                    stacked_cp = apply_magnitude_scaling(
-                        stacked_cp, stacked_cp_weights,
-                        magnitude_scaling, max_scaling_factor,
-                        ref_idx=ref_idx)
-
-            # Rank adjustment (no-op)
-            stacked_cp = adjust_ranks(stacked_cp, rep_key)
-
-            # ── Single merge call on stacked 3D tensors ────────────
-            memory_guard()  # Check right before the big allocation
+            # try/except covers stacking AND merge to handle OOM during
+            # torch.stack() (previously outside the merge_fn try/except).
+            # If stacking itself OOMs, cp_buffers still exists and we extract
+            # from cp_buffers directly. If merge_fn OOMs, cp_buffers was freed
+            # and we extract from stacked_cp instead.
             try:
-                batch_result = merge_fn(
-                    stacked_cp, stacked_cp_weights,
-                    blend_mode=blend_mode, **merge_kwargs)
-            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-                if "CUDA out of memory" in str(e):
-                    print(f"   ⚠️ CUDA OOM on shape group {shape} — falling back to per-key CPU processing")
-                    # Fall back to per-key sequential processing on CPU.
-                    # Each key goes through _process_single_key which has its
-                    # own OOM handler that moves individual tensors to CPU.
+                stacked_cp: List[torch.Tensor] = []
+                stacked_cp_weights: List[float] = []
+                for cp_idx in range(num_sources):
+                    if cp_buffers[cp_idx]:
+                        stacked_cp.append(
+                            torch.stack(cp_buffers[cp_idx], dim=0))
+                        # All keys share the same checkpoint weight
+                        stacked_cp_weights.append(cp_weight_vals[cp_idx][0])
+
+                # Free individual GPU tensors — only stacked version needed.
+                # Without this, cp_buffers (~4 GB for largest Flux groups) coexists
+                # with stacked_cp (~4 GB), doubling source-data GPU memory and
+                # causing CUDA OOM when merge intermediates are added on top.
+                del cp_buffers
+                del cp_weight_vals
+
+                if len(stacked_cp) < 2:
+                    # Not enough sources for batched merge — process individually
+                    # to avoid dropping unique keys (e.g. position embeddings
+                    # present in only 1 checkpoint).
+                    # Note: cp_buffers was freed above — extract from stacked_cp instead.
                     for ki, key in enumerate(batch_keys):
-                        t_list = [cb[ki].cpu() for cb in cp_buffers if ki < len(cb)]
-                        w_list = [cw[ki] for cw in cp_weight_vals if ki < len(cw)]
+                        t_list = [sc[ki] for sc in stacked_cp if ki < sc.size(0)]
+                        w_list = [stacked_cp_weights[si] for si, sc in enumerate(stacked_cp) if ki < sc.size(0)]
                         if len(t_list) >= 2:
                             result = _process_single_key(key, t_list, w_list)
                             result = _apply_density(result, key)
                             merged[key] = result.cpu()
                         elif len(t_list) == 1:
+                            # Single-source key: component-scale and weight
                             scaled = apply_component_scaling(
                                 t_list[0], key,
                                 weight_unet, weight_clip, weight_vae, weight_te)
                             merged[key] = (scaled * w_list[0]).cpu()
                         if on_substep:
                             on_substep(1)
+                    continue
+
+                # Component scaling — verify all keys belong to same component
+                rep_key = batch_keys[0]
+                rep_category = categorize_key(rep_key)
+                all_same_comp = all(categorize_key(k) == rep_category for k in batch_keys)
+                if not all_same_comp:
+                    # Mixed-component group — fall back to per-key processing
+                    # Note: cp_buffers was freed above — extract from stacked_cp instead.
+                    for ki, key in enumerate(batch_keys):
+                        t_list = [sc[ki] for sc in stacked_cp if ki < sc.size(0)]
+                        w_list = [stacked_cp_weights[si] for si, sc in enumerate(stacked_cp) if ki < sc.size(0)]
+                        if len(t_list) >= 2:
+                            result = _process_single_key(key, t_list, w_list)
+                            result = _apply_density(result, key)
+                            merged[key] = result.cpu()
+                        elif len(t_list) == 1:
+                            # Single-source key: component-scale and weight
+                            scaled = apply_component_scaling(
+                                t_list[0], key,
+                                weight_unet, weight_clip, weight_vae, weight_te)
+                            merged[key] = (scaled * w_list[0]).cpu()
+                        if on_substep:
+                            on_substep(1)
+                    continue
+                # All same component — proceed with batched scaling
+                for idx in range(len(stacked_cp)):
+                    stacked_cp[idx] = apply_component_scaling(
+                        stacked_cp[idx], rep_key,
+                        weight_unet, weight_clip, weight_vae, weight_te)
+
+                # Magnitude equalization
+                if magnitude_scaling != "none" and len(stacked_cp) >= 2:
+                    orig_indices = [i for i, sd in enumerate(sds)
+                                    if rep_key in sd]
+                    if 0 in orig_indices:
+                        ref_idx = orig_indices.index(0)
+                        stacked_cp = apply_magnitude_scaling(
+                            stacked_cp, stacked_cp_weights,
+                            magnitude_scaling, max_scaling_factor,
+                            ref_idx=ref_idx)
+
+                # Rank adjustment (no-op)
+                stacked_cp = adjust_ranks(stacked_cp, rep_key)
+
+                # ── Single merge call on stacked 3D tensors ────────────
+                memory_guard()  # Check right before the big allocation
+                batch_result = merge_fn(
+                    stacked_cp, stacked_cp_weights,
+                    blend_mode=blend_mode, **merge_kwargs)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if isinstance(e, torch.cuda.OutOfMemoryError) or "CUDA out of memory" in str(e):
+                    print(f"   ⚠️ CUDA OOM on shape group {shape} — falling back to per-key CPU processing")
+                    # Determine whether cp_buffers was already freed (OOM at merge_fn
+                    # or during scaling) or still exists (OOM at torch.stack above).
+                    try:
+                        _ = cp_buffers
+                        cp_freed = False
+                    except NameError:
+                        cp_freed = True
+
+                    if cp_freed:
+                        # cp_buffers was deleted — extract from stacked_cp
+                        for ki, key in enumerate(batch_keys):
+                            t_list = [sc[ki].cpu() for sc in stacked_cp if ki < sc.size(0)]
+                            w_list = [stacked_cp_weights[si] for si, sc in enumerate(stacked_cp) if ki < sc.size(0)]
+                            if len(t_list) >= 2:
+                                result = _process_single_key(key, t_list, w_list)
+                                result = _apply_density(result, key)
+                                merged[key] = result.cpu()
+                            elif len(t_list) == 1:
+                                scaled = apply_component_scaling(
+                                    t_list[0], key,
+                                    weight_unet, weight_clip, weight_vae, weight_te)
+                                merged[key] = (scaled * w_list[0]).cpu()
+                            if on_substep:
+                                on_substep(1)
+                    else:
+                        # cp_buffers still exists — extract directly (OOM at torch.stack)
+                        for ki, key in enumerate(batch_keys):
+                            t_list = [cb[ki].cpu() for cb in cp_buffers if ki < len(cb)]
+                            w_list = [cw[ki] for cw in cp_weight_vals if ki < len(cw)]
+                            if len(t_list) >= 2:
+                                result = _process_single_key(key, t_list, w_list)
+                                result = _apply_density(result, key)
+                                merged[key] = result.cpu()
+                            elif len(t_list) == 1:
+                                scaled = apply_component_scaling(
+                                    t_list[0], key,
+                                    weight_unet, weight_clip, weight_vae, weight_te)
+                                merged[key] = (scaled * w_list[0]).cpu()
+                            if on_substep:
+                                on_substep(1)
                     # Free source tensor references before continuing
-                    # (the normal cleanup at lines 728-731 is skipped by this continue)
+                    # (the normal cleanup after the try/except is skipped by this continue)
                     for key in keys:
                         for sd in sds:
                             sd.pop(key, None)
@@ -748,7 +869,9 @@ def merge_triple_method(sds: List[Dict[str, torch.Tensor]],
                 # over/under-correcting individual keys with different
                 # energy profiles within the same shape batch.
                 if energy_preservation:
-                    per_key_tensors = [cb[ki] for cb in cp_buffers if ki < len(cb)]
+                    # Extract per-key tensors from stacked_cp (cp_buffers was freed
+                    # after stacking to eliminate double GPU allocation).
+                    per_key_tensors = [sc[ki] for sc in stacked_cp if ki < sc.size(0)]
                     key_result = ensure_energy_preservation_triple(
                         key_result, per_key_tensors, stacked_cp_weights,
                         threshold=0.8, gain_min=1.0, target='avg')
@@ -757,18 +880,33 @@ def merge_triple_method(sds: List[Dict[str, torch.Tensor]],
 
             if on_substep:
                 on_substep(len(batch_keys))
+            print(f"   🕐 [t={time.time()-_mt_t0:.1f}s] merge_triple_method: shape-batch group done ({len(batch_keys)} keys, shape={shape})")
             comfyui_yield()  # Prevent UI stalling between shape groups
 
             # ── Free GPU memory before next shape group ──
-            if device.type == 'cuda':
-                # Free stacked/intermediate merge tensors
-                del stacked_cp
-                del batch_result
-                # Free processed source tensors from GPU (results are in merged dict on CPU)
-                for key in keys:
-                    for sd in sds:
-                        sd.pop(key, None)
-                torch.cuda.empty_cache()
+            # try/except safety net: torch.cuda.empty_cache() triggers a CUDA
+            # sync which can surface ASYNCHRONOUS CUDA OOM errors from the
+            # merge_fn that just completed.  Without this guard, such delayed
+            # OOMs propagate past both Fix 7 and Fix 5 to the weave-level
+            # handler, causing unnecessary CPU fallback for ALL remaining batches.
+            try:
+                if device.type == 'cuda':
+                    # Free stacked/intermediate merge tensors
+                    del stacked_cp
+                    del batch_result
+                    # Free processed source tensors from GPU (results are in merged dict on CPU)
+                    for key in keys:
+                        for sd in sds:
+                            sd.pop(key, None)
+                    torch.cuda.empty_cache()
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                if isinstance(e, torch.cuda.OutOfMemoryError) or "CUDA out of memory" in str(e):
+                    # Delayed OOM from a previous operation surfacing at sync point.
+                    # The shape group already completed successfully (merged dict populated).
+                    # Just log and continue — no data loss.
+                    print(f"   ⚠️ Delayed CUDA OOM during cleanup after shape group {shape} — continuing (no data loss)")
+                else:
+                    raise
 
         # ═══════════════════════════════════════════════════════════
         # PHASE B: Sequential processing (remaining keys)
@@ -834,6 +972,7 @@ def merge_triple_method(sds: List[Dict[str, torch.Tensor]],
     # Fallback: no batching — pure sequential (existing behavior)
     # ═══════════════════════════════════════════════════════════════════
     else:
+        print(f"   🕐 [t={time.time()-_mt_t0:.1f}s] merge_triple_method: shape batching not viable — using pure sequential")
 
         effective_bs = batch_size if streaming else total_keys
         for batch_start in range(0, total_keys, effective_bs):
@@ -903,4 +1042,5 @@ def merge_triple_method(sds: List[Dict[str, torch.Tensor]],
 
     if corrupted_keys:
         print(f"   ⚠️ {len(corrupted_keys)} corrupted/absurd tensors skipped during merge")
+    print(f"   🕐 [t={time.time()-_mt_t0:.1f}s] merge_triple_method returning ({len(merged)} keys)")
     return merged, corrupted_keys

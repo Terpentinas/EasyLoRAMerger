@@ -40,15 +40,24 @@ except ImportError:
 
 
 def _compute_active_masks(tensors, active_threshold=1e-8):
-    """Compute 7 active-region masks for 3 tensors.
+    """Compute active-region masks for 2 or 3 tensors.
 
     From checkpoint_methods — cleaner, single responsibility.
 
+    When only 2 tensors are provided (N=2), C-related masks (only_c, both_ac,
+    both_bc, all_three) evaluate to False, so the caller correctly handles
+    a two-way merge with active blend mode.  The both_ab mask captures the
+    intersection of A and B as expected.
+
     Returns (only_a, only_b, only_c, both_ab, both_ac, both_bc, all_three).
     """
+    n = len(tensors)
     a_active = torch.abs(tensors[0]) > active_threshold
     b_active = torch.abs(tensors[1]) > active_threshold
-    c_active = torch.abs(tensors[2]) > active_threshold
+    if n >= 3:
+        c_active = torch.abs(tensors[2]) > active_threshold
+    else:
+        c_active = torch.zeros_like(a_active, dtype=torch.bool)
     only_a = a_active & ~b_active & ~c_active
     only_b = ~a_active & b_active & ~c_active
     only_c = ~a_active & ~b_active & c_active
@@ -60,13 +69,24 @@ def _compute_active_masks(tensors, active_threshold=1e-8):
 
 
 def _weight_tensors(tensors, weights):
-    """Return weighted versions of 3 tensors.
+    """Return weighted versions of up to 3 tensors.
 
     From checkpoint_methods — reusable, single responsibility.
+
+    When only 2 tensors are provided (N=2), the third weighted tensor is
+    returned as a zero tensor.  This ensures tuple unpacking
+    (``a_w, b_w, c_w = _weight_tensors(...)``) never fails, and all
+    C-related branches in active-mode merge functions safely operate on
+    zeros (whose associated masks are always False via _compute_active_masks).
     """
-    return (tensors[0] * weights[0],
-            tensors[1] * weights[1],
-            tensors[2] * weights[2])
+    n = len(tensors)
+    aw = tensors[0] * weights[0]
+    bw = tensors[1] * weights[1]
+    if n >= 3:
+        cw = tensors[2] * weights[2]
+    else:
+        cw = torch.zeros_like(aw)
+    return (aw, bw, cw)
 
 
 def _assign_single_active(result, weighted, only_a, only_b, only_c):
@@ -608,7 +628,7 @@ def merge_svd_preserve(tensors, weights, blend_mode="auto", **kwargs):
             result[all_three] = apply_svd_reduction(region, preserve_ratio).to(tensors[0].dtype)
         return result
     else:
-        combined = tensors[0].float() * weights[0] + tensors[1].float() * weights[1] + tensors[2].float() * weights[2]
+        combined = sum(t.float() * w for t, w in zip(tensors, weights))
         result = apply_svd_reduction(combined, preserve_ratio)
         return result.to(tensors[0].dtype)
 
@@ -652,13 +672,11 @@ def merge_noise_aware(tensors, weights, blend_mode="auto", **kwargs):
 
         return result
     else:
-        threshold_a = noise_threshold * tensors[0].abs().max()
-        threshold_b = noise_threshold * tensors[1].abs().max()
-        threshold_c = noise_threshold * tensors[2].abs().max()
-        a_clean = torch.where(tensors[0].abs() < threshold_a, tensors[0] * 0.1, tensors[0])
-        b_clean = torch.where(tensors[1].abs() < threshold_b, tensors[1] * 0.1, tensors[1])
-        c_clean = torch.where(tensors[2].abs() < threshold_c, tensors[2] * 0.1, tensors[2])
-        return a_clean * weights[0] + b_clean * weights[1] + c_clean * weights[2]
+        cleaned = []
+        for t, w in zip(tensors, weights):
+            threshold = noise_threshold * t.abs().max()
+            cleaned.append(torch.where(t.abs() < threshold, t * 0.1, t) * w)
+        return sum(cleaned)
 
 
 # ── 11. merge_gradient_alignment (winner: checkpoint_methods) ─────────
@@ -706,14 +724,18 @@ def merge_gradient_alignment(tensors, weights, blend_mode="auto", **kwargs):
 
         return result
     else:
-        a_fp32 = tensors[0].float() * weights[0]
-        b_fp32 = tensors[1].float() * weights[1]
-        c_fp32 = tensors[2].float() * weights[2]
-        align_ab = compute_per_channel_alignment(a_fp32, b_fp32)
-        align_ac = compute_per_channel_alignment(a_fp32, c_fp32)
-        align_bc = compute_per_channel_alignment(b_fp32, c_fp32)
-        alignment = (align_ab + align_ac + align_bc) / 3
-        merged = a_fp32 * alignment + b_fp32 * alignment + c_fp32 * alignment
+        # Weighted tensors
+        weighted = [t.float() * w for t, w in zip(tensors, weights)]
+        n = len(weighted)
+        # Pairwise alignment: average cosine similarity across all pairs
+        align_sum = 0.0
+        pair_count = 0
+        for i in range(n):
+            for j in range(i + 1, n):
+                align_sum = align_sum + compute_per_channel_alignment(weighted[i], weighted[j])
+                pair_count += 1
+        alignment = align_sum / max(pair_count, 1)
+        merged = sum(w * alignment for w in weighted)
         return merged.to(dtype)
 
 

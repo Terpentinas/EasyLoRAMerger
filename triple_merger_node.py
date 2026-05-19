@@ -11,10 +11,9 @@ from typing import Dict, Any, List, Optional
 import folder_paths
 import comfy.sd
 import comfy.utils
-from .config import MergeConfig, PRECISION_OPTIONS, DEVICE_OPTIONS, DevicePrecisionConfig, ACTIVE_THRESHOLD_DEFAULT
+from .config import MergeConfig, PRECISION_STANDARD, DEVICE_OPTIONS, DevicePrecisionConfig, ACTIVE_THRESHOLD_DEFAULT
 from .utils import (
     load_lora_with_metadata,
-    save_lora_data_to_temp,
     save_safetensors_file,
     get_user_output_path,
     get_experiment_temp_path,
@@ -105,7 +104,7 @@ class EasyLoRATripleMerger:
 
                 # ── SECTION 5: HARDWARE ─────────────────────────────────
                 "device": (DEVICE_OPTIONS, {"default": "auto"}),
-                "precision": (PRECISION_OPTIONS, {"default": "auto"}),
+                "precision": (PRECISION_STANDARD, {"default": "auto"}),
                 "batch_size": ("INT", {"default": 32, "min": 1, "max": 256, "step": 8,
                     "tooltip": "Number of keys to process per batch. "
                                "DeviceManager.suggest_batch_size() can auto-tune based on VRAM."}),
@@ -183,6 +182,11 @@ class EasyLoRATripleMerger:
         keep_alphas = False
         bake_custom_scale = 1.0
 
+        # ══ Runtime precision guard — protect against stale workflow JSONs ══
+        if precision not in PRECISION_STANDARD:
+            print(f"   ⚠️ Precision '{precision}' is no longer available, falling back to 'auto'")
+            precision = "auto"
+
         # Resolve active_threshold bool to actual float threshold value
         # True  → use the default threshold from config.py
         # False → use 0.0 (all non-zero values treated as active, effectively disabling)
@@ -217,15 +221,21 @@ class EasyLoRATripleMerger:
         
         two_way_mode = False
         missing_allowed_for_c = False
+        sds = []
+        metas = []
         for i, (data, dropdown, name) in enumerate(zip(loras_data, loras_dropdown, names)):
             if data is not None:
-                path = save_lora_data_to_temp(data, name)
-                print(f"📄 {name}: LORA data (temp)")
-                paths.append(path)
+                # LORA data input: unpack state dict directly — no temp file needed
+                lora_dict = data[0] if isinstance(data, (tuple, list)) else data
+                sds.append(lora_dict)
+                metas.append({})
+                print(f"📄 {name}: LORA data (in‑memory, {len(lora_dict)} tensors)")
             elif dropdown != "None" and dropdown:
                 path = folder_paths.get_full_path("loras", dropdown)
                 print(f"📄 {name}: {dropdown}")
-                paths.append(path)
+                sd, meta = load_lora_with_metadata(Path(path))
+                sds.append(sd)
+                metas.append(meta)
             else:
                 # Missing input
                 if name == "C":
@@ -233,7 +243,6 @@ class EasyLoRATripleMerger:
                     print(f"⚠️ {name}: Missing input – falling back to two‑way merge (A + B)")
                     two_way_mode = True
                     missing_allowed_for_c = True
-                    # Do not add a path; break out of loop? Continue to next iteration (there is none)
                     continue
                 else:
                     # Missing A or B is fatal
@@ -247,14 +256,7 @@ class EasyLoRATripleMerger:
         else:
             output_path = get_experiment_temp_path("triple")
         
-        # Load all three
-        print("📥 Loading LoRAs...")
-        sds = []
-        metas = []
-        for path in paths:
-            sd, meta = load_lora_with_metadata(Path(path))
-            sds.append(sd)
-            metas.append(meta)
+        print("📥 Loaded LoRAs in memory")
         
         # Extract trigger words and warn about conflicts
         converter = MusubiLoraConverter()

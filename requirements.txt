@@ -3,3 +3,6 @@
 torch>=2.0.0
 safetensors>=0.4.0
 numpy
+
+# GGUF output for Checkpoint Studio (block-wise quantization for ComfyUI-GGUF)
+gguf>=0.13.0

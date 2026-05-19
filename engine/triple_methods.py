@@ -312,7 +312,7 @@ def merge_triple_method(sds: List[Dict[str, torch.Tensor]],
                     if tensors:
                         # Unique key (present in only one LoRA) – still apply scaling already done
                         result = tensors[0] * valid_weights[0]
-                        merged[key] = result.cpu(non_blocking=True) if result.device.type == 'cuda' else result.cpu()
+                        merged[key] = result
                     continue
 
                 # Signal magnitude equalization (RMS/percentile scaling) if enabled
@@ -359,16 +359,21 @@ def merge_triple_method(sds: List[Dict[str, torch.Tensor]],
                     mask = result.abs() >= threshold_val
                     result = result * mask
 
-                merged[key] = result.cpu(non_blocking=True) if result.device.type == 'cuda' else result.cpu()
+                # Keep result on GPU within batch; batch transfer to CPU below
+                merged[key] = result
 
                 # Cleanup
                 del tensors
 
                 merge_progress += 1
 
-        # Optional: clear GPU cache after each batch if streaming enabled
-        if streaming and device.type == 'cuda':
-            torch.cuda.empty_cache()
+        # Transfer entire batch from GPU → CPU in one shot, then clear cache
+        if device.type == 'cuda':
+            for key in batch_keys:
+                if key in merged and merged[key].device.type == 'cuda':
+                    merged[key] = merged[key].cpu()
+            if streaming:
+                torch.cuda.empty_cache()
 
     # Build master_map from input mappings (identity map for key restoration)
     master_map: Dict[str, str] = {}

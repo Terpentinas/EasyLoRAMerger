@@ -40,14 +40,67 @@ RAM_GUARD_THRESHOLD: float = 0.85
 # Setting to 0.0 disables filtering (all non-zero values treated as active).
 ACTIVE_THRESHOLD_DEFAULT: float = 1e-8
 
+# ── INT8 percentile clipping for outlier reduction ─────────────────────
+# Controls how compute_int8_scale() handles outlier weights during
+# per-channel INT8 quantization. When set to < 1.0, the per-channel
+# scale is computed from the value at this percentile (e.g. 0.999 =
+# 99.9th percentile) instead of the absolute maximum, preventing a
+# single extreme outlier from compressing the effective INT8 range.
+#
+# Example: 99.9% of weights in [-0.5, 0.5], one outlier at 10.0
+#   Without clipping: scale = 10.0/127 ≈ 0.079 → bulk maps to ±6 (5%)
+#   With 99.9% clip:  scale =  0.5/127 ≈ 0.004 → bulk maps to ±127 (100%)
+#
+# How to tune (advanced users, edit this file):
+#   1.0   → Disable clipping (revert to max-based, original behavior)
+#   0.999 → Clip at 99.9th percentile (default, recommended)
+#   0.99  → Clip more aggressively (higher saturation risk)
+#   0.9   → Very aggressive clipping (only if outliers dominate)
+INT8_CLIP_PERCENTILE: float = 1.0
+
+# ── SVD minimum dimension threshold ──────────────────────────────
+# Controls the minimum dimension for SVD compression.
+# Tensors where both dimensions are below this value are skipped.
+# Set higher to only compress large matrices; set lower to compress more.
+# Default 128 matches the original hardcoded value in _apply_svd_to_tensor().
+SVD_MIN_DIMENSION: int = 128
+
+# ── SVD selective mode minimum dimension ─────────────────────────
+# In "selective" mode, weight matrices with both dimensions below
+# this value are skipped. Only large matrices benefit from SVD in
+# selective mode.
+# Default 1024 matches the original hardcoded value.
+SVD_SELECTIVE_MIN_DIM: int = 1024
+
+# ── SVD parameter threshold for intermediate cleanup ─────────────
+# Tensors with more than this many parameters trigger explicit
+# intermediate variable cleanup (del U, S, Vh, sqrt_Sk, tensor_fp32)
+# to free GPU memory during SVD.
+# Default 1,048,576 (1024*1024) matches original hardcoded value.
+SVD_CLEANUP_PARAM_THRESHOLD: int = 1048576
+
 # Suppress warnings
 warnings.filterwarnings("ignore", message="lora key not loaded")
 
 
 # ── Shared UI option lists (single source of truth for all nodes) ──
-PRECISION_OPTIONS = ["auto", "float32", "bfloat16", "float16",
-                     "fp8", "fp8_e4m3fn", "fp8_e5m2"]
+# Standard float precisions — safe for all nodes without dequant.
+PRECISION_STANDARD = ["auto", "float32", "bfloat16", "float16"]
+
+# Extended with FP8 — only for nodes with proper dequant pipelines.
+PRECISION_EXTENDED = PRECISION_STANDARD + ["fp8_e4m3fn", "fp8_e5m2"]
+
+# Full studio toolkit — includes INT8 and SVD for precision conversion.
+# Only MusubiCheckpointStudio uses this tier; it implements the actual
+# conversion pipelines for int8, int8_convrot, and svd_only.
+PRECISION_STUDIO = PRECISION_EXTENDED + ["int8", "int8_convrot", "svd_only"]
+
 DEVICE_OPTIONS = ["auto", "cuda", "cpu"]
+
+# GGUF output format options for Checkpoint Studio.
+# Each entry maps to a GGMLQuantizationType in engine/gguf_writer.py.
+# "safetensors" retains the existing output path (FP8/BF16/INT8 safetensors file).
+FORMAT_OPTIONS = ["safetensors", "gguf_q8_0", "gguf_q5_0", "gguf_q4_0"]
 
 
 # ── Unified device/precision resolver ──

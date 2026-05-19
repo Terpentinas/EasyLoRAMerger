@@ -18,10 +18,9 @@ import folder_paths
 import comfy.sd
 
 # Local imports
-from ..config import PRECISION_OPTIONS, DEVICE_OPTIONS
+from ..config import PRECISION_STANDARD, DEVICE_OPTIONS
 from ..utils import (
     load_lora_with_metadata,
-    save_lora_data_to_temp,
     categorize_key,
     DeviceManager,
     ProgressTracker,
@@ -162,7 +161,7 @@ class MusubiLoraConverter:
                 }),
 
                 # ── SECTION 5: HARDWARE ─────────────────────────────────
-                "precision": (PRECISION_OPTIONS, {"default": "auto"}),
+                "precision": (PRECISION_STANDARD, {"default": "auto"}),
                 "device": (DEVICE_OPTIONS, {"default": "auto"}),
 
                 # ── SECTION 6: OUTPUT (continued) ───────────────────────
@@ -382,62 +381,40 @@ class MusubiLoraConverter:
     FUNCTION = "convert"
     CATEGORY = "LoRA/Universal"
 
-    def convert(self, save_trigger=False, filename="converted_lora",
-                target_format="auto", compression_mode="original", target_rank=128,
-                apply_weight_scaling=False, bake_custom_scale=1.0,
-                lora="None", lora_data=None, save_folder="",
-                te_mode="original", te_weight=1.0, precision="auto", device="auto",
-                node_id=None, model=None, clip=None):
 
-        print("\n" + "="*50)
-        print("🔄 Universal EasyLoRA Converter")
-        print("="*50)
+    # ── Extracted helpers for convert() ────────────────────────────────────────
 
-        # Defensive conversion for UI mapping bugs (workflow saved old values)
-        if isinstance(target_rank, str):
-            try:
-                target_rank = int(target_rank)
-            except ValueError:
-                target_rank = 128
-                print(f"⚠️ target_rank could not be parsed as integer, defaulting to {target_rank}")
+    @staticmethod
+    def _resolve_input(lora, lora_data):
+        """Resolve input source (lora_data dict or file path).
 
-        # Handle legacy te_mode values (e.g., 'False' from old workflows)
-        if isinstance(te_mode, str) and te_mode.lower() == 'false':
-            te_mode = 'original'
-        # Handle legacy compression_mode numeric values
-        if compression_mode == '1' or compression_mode == 1:
-            compression_mode = 'auto-full'
-
-        # Backward compatibility: treat 'auto' as 'auto‑full'
-        if compression_mode == 'auto':
-            compression_mode = 'auto-full'
-
-        # Get input path
+        Returns (sd, metadata, source_type) or sentinel (None, None, None, "", "")
+        if no input is provided.
+        """
         if lora_data is not None:
-            path = save_lora_data_to_temp(lora_data, "musubi")
-            source_type = "LORA data input"
+            lora_dict = lora_data[0] if isinstance(lora_data, (tuple, list)) else lora_data
+            sd = lora_dict
+            metadata = {}
+            source_type = "LORA data input (in-memory)"
+            print(f"\U0001f4c4 Source: {source_type} ({len(sd)} tensors)")
+            return sd, metadata, source_type
         elif lora != "None" and lora:
             path = folder_paths.get_full_path("loras", lora)
             source_type = f"dropdown: {lora}"
+            print(f"\U0001f4c4 Source: {source_type}")
+            print(f"\U0001f4c1 Path: {path}")
+            sd, metadata = load_lora_with_metadata(Path(path))
+            return sd, metadata, source_type
         else:
-            print("❌ No LoRA input provided")
+            print("\u274c No LoRA input provided")
             return (None, None, None, "", "")
 
-        print(f"📄 Source: {source_type}")
-        print(f"📁 Path: {path}")
+    def _handle_normalization(self, sd, metadata, target_format):
+        """Normalize LoRA state dict to master format.
 
-        # Load the LoRA
-        sd, metadata = load_lora_with_metadata(Path(path))
-
-        # Detect actual format (for logging)
-        detected_format = detect_lora_format(sd)
-        print(f"🔍 Detected format: {detected_format}")
-
-        # Analyze structure
-        info = self.analyze_lora_structure(sd, metadata)
-        
-        # Step 1: Normalize to master format
-        # SD1.5 Diffusers LoRA detection: bridge preserves block structure (avoids ~175/396 key loss)
+        Returns (normalized_sd, key_map).
+        SD1.5 Diffusers LoRA detected via bridge for block-structure preservation.
+        """
         from .diffusers_bridge import detect_diffusers_sd15_lora, normalize_diffusers_preserving
 
         if detect_diffusers_sd15_lora(sd) and target_format != "comfy_native":
@@ -446,28 +423,31 @@ class MusubiLoraConverter:
         else:
             normalized_sd, key_map = identity_normalize(sd, metadata)
         print(f"Normalized to master format: {len(normalized_sd)} keys")
+        return normalized_sd, key_map
 
-        # Determine target device for SVD compression
+    def _handle_compression(self, normalized_sd, compression_mode, target_rank, device, info):
+        """Apply SVD compression if requested. Modifies info in-place.
+
+        Returns (normalized_sd, compression_info).
+        """
         target_device = DeviceManager.get_device(device)
         if compression_mode != "original" and target_device.type != "cpu":
-            # Move tensors to GPU before SVD for faster computation
             moved_count = 0
             for k in list(normalized_sd.keys()):
                 if normalized_sd[k].device != target_device:
                     normalized_sd[k] = normalized_sd[k].to(device=target_device)
                     moved_count += 1
             if moved_count > 0:
-                print(f"🔧 Moved {moved_count} tensors to {target_device} for SVD compression")
+                print(f"\U0001f527 Moved {moved_count} tensors to {target_device} for SVD compression")
 
-        # Apply SVD compression if requested
         if compression_mode != "original":
-            print(f"🔧 Applying SVD compression ({compression_mode})...")
+            print(f"\U0001f527 Applying SVD compression ({compression_mode})...")
             normalized_sd, compression_info = self._apply_svd_compression(
                 normalized_sd, compression_mode, target_rank
             )
-            # Update info with compression details for forensic report
             info.update(compression_info)
-            print(f"🔧 Compression applied. Final rank: {compression_info.get('final_rank', 'N/A'):.1f}, size saved: {compression_info.get('size_saved_mb', 0):.2f} MB")
+            print(f"\U0001f527 Compression applied. Final rank: {compression_info.get('final_rank', 'N/A'):.1f}, "
+                  f"size saved: {compression_info.get('size_saved_mb', 0):.2f} MB")
         else:
             compression_info = {
                 'compression_mode': 'original',
@@ -475,79 +455,78 @@ class MusubiLoraConverter:
                 'size_saved_mb': 0.0,
             }
             info.update(compression_info)
+        return normalized_sd, compression_info
 
-        # TE control
+    @staticmethod
+    def _handle_te_control(normalized_sd, te_mode, te_weight):
+        """Apply Text Encoder modifications (remove or scale) in-place."""
         if te_mode != "original":
             te_keys = [k for k in normalized_sd.keys() if categorize_key(k) == 'te']
             if not te_keys:
-                print("🔤 No Text Encoder keys detected, skipping TE modification")
+                print("\U0001f524 No Text Encoder keys detected, skipping TE modification")
             else:
                 if te_mode == "remove" or (te_mode == "scale" and te_weight == 0.0):
                     for key in te_keys:
                         del normalized_sd[key]
                     label = "Removed" if te_mode == "remove" else "Weight is 0.0, removed"
-                    print(f"🔤 {label} {len(te_keys)} TE keys")
+                    print(f"\U0001f524 {label} {len(te_keys)} TE keys")
                 elif te_mode == "scale":
                     scaled_count = 0
                     for key in te_keys:
                         normalized_sd[key] = normalized_sd[key] * te_weight
                         scaled_count += 1
-                    print(f"🔤 Scaled {scaled_count} TE keys by {te_weight}x")
+                    print(f"\U0001f524 Scaled {scaled_count} TE keys by {te_weight}x")
 
-        # Weight scaling if requested
+    @staticmethod
+    def _handle_weight_scaling(normalized_sd, bake_custom_scale):
+        """Apply up-weight scaling to LoRA up-weights. Returns effective_scaling bool."""
         effective_scaling = abs(bake_custom_scale - 1.0) > 1e-6
         if effective_scaling:
-            print(f"⚖️ Applying up‑weight scaling: {bake_custom_scale}x")
+            print(f"\u2696\ufe0f Applying up-weight scaling: {bake_custom_scale}x")
             scaled_keys = 0
             for key in list(normalized_sd.keys()):
                 if key.endswith(".weight") and ("lora_B" in key or "lora_up" in key):
                     normalized_sd[key] = normalized_sd[key] * bake_custom_scale
                     scaled_keys += 1
-            print(f"   Scaled {scaled_keys} up‑weight tensors")
-        apply_weight_scaling = effective_scaling
+            print(f"   Scaled {scaled_keys} up-weight tensors")
+        return effective_scaling
 
-        # Step 2: Restore original keys using identity map, then apply format-specific conversions
-        
-        # Auto‑detect target format if "auto"
+    def _handle_format_conversion(self, normalized_sd, key_map, target_format, info):
+        """Auto-detect target format, convert keys, apply alpha baking.
+
+        Returns (converted_sd, effective_target_format, bake_alphas_flag).
+        """
         effective_target_format = target_format
         if target_format == "auto":
-            # Infer separator and naming styles from normalized keys
             separator = infer_separator_style(list(normalized_sd.keys()))
             naming = infer_naming_style(list(normalized_sd.keys()))
-            # Determine ecosystem
             target_ecosystem = info.get('target_ecosystem', 'Unknown')
             primary_structure = info.get('primary_structure', '')
-            # Decision logic
+
             if target_ecosystem in ("Flux.1-Dev/S", "Z-Image"):
-                # Flux/Z‑Image models benefit from forge_optimized (prefix mapping)
                 if separator == "underscore" and naming == "lora_down_up":
                     effective_target_format = "forge_optimized"
                 else:
-                    # Fallback to comfy_native for dot separator
                     effective_target_format = "comfy_native"
             elif separator == "dot" and naming == "lora_a_b":
                 effective_target_format = "comfy_native"
             else:
-                # Default to standard_webui (underscore + lora_down_up)
                 effective_target_format = "standard_webui"
-            print(f"🔍 Auto‑selected target format: {effective_target_format} (separator={separator}, naming={naming}, ecosystem={target_ecosystem})")
-        
-        # Legacy‑aware alpha baking — automatic based on model type
+            print(f"\U0001f50d Auto-selected target format: {effective_target_format} "
+                  f"(separator={separator}, naming={naming}, ecosystem={target_ecosystem})")
+
         target_ecosystem = info.get('target_ecosystem', 'Unknown')
         if target_ecosystem in ("Flux.1-Dev/S", "Z-Image"):
-            bake_alphas_flag = True   # bake alphas for Flux/Z‑Image
+            bake_alphas_flag = True
         else:
-            bake_alphas_flag = False  # keep alphas for SDXL/SD1.5
-        print(f"📝 Legacy‑aware alpha baking: alphas will be {'baked' if bake_alphas_flag else 'kept'} (detected {target_ecosystem})")
-        
-        # Use finalize_for_save with identity map for perfect key restoration
+            bake_alphas_flag = False
+        print(f"\U0001f4dd Legacy-aware alpha baking: alphas will be "
+              f"{'baked' if bake_alphas_flag else 'kept'} (detected {target_ecosystem})")
+
         restored_sd, _ = finalize_for_save(
-            normalized_sd,
-            key_map,
-            target_format=effective_target_format
+            normalized_sd, key_map, target_format=effective_target_format
         )
-        
-        # Apply forge_optimized prefix mapping (diffusion_model → transformer for Flux DiT blocks)
+
         if effective_target_format == 'forge_optimized':
             prefix_mapped = {}
             for key, tensor in restored_sd.items():
@@ -555,34 +534,42 @@ class MusubiLoraConverter:
                     key = 'transformer.' + key[len('diffusion_model.'):]
                 prefix_mapped[key] = tensor
             restored_sd = prefix_mapped
-        
-        # Apply alpha baking if requested
+
         if bake_alphas_flag:
             from ..utils import bake_alphas
             baking_naming_style = infer_naming_style(list(restored_sd.keys()))
             restored_sd = bake_alphas(restored_sd, naming_style=baking_naming_style)
-        
-        converted_sd = restored_sd
-        print(f"🎯 Converted to {effective_target_format}: {len(converted_sd)} keys")
 
-        # Apply precision/device casting if not auto
+        converted_sd = restored_sd
+        print(f"\U0001f3af Converted to {effective_target_format}: {len(converted_sd)} keys")
+        return converted_sd, effective_target_format, bake_alphas_flag
+
+    @staticmethod
+    def _handle_precision_cast(converted_sd, precision, device):
+        """Apply precision/device casting if not auto."""
         if precision != "auto" or device != "auto":
             target_device = DeviceManager.get_device(device)
             if precision != "auto":
                 target_dtype = DeviceManager.get_dtype(precision, target_device)
             else:
-                target_dtype = None  # keep existing dtype
+                target_dtype = None
             cast_count = 0
             for key in list(converted_sd.keys()):
                 tensor = converted_sd[key]
                 if tensor.device != target_device or (target_dtype is not None and tensor.dtype != target_dtype):
-                    converted_sd[key] = tensor.to(device=target_device, dtype=target_dtype if target_dtype is not None else tensor.dtype)
+                    converted_sd[key] = tensor.to(
+                        device=target_device,
+                        dtype=target_dtype if target_dtype is not None else tensor.dtype
+                    )
                     cast_count += 1
             if cast_count > 0:
-                print(f"🔧 Cast {cast_count} tensors to {target_dtype if target_dtype else 'same dtype'} on {target_device}")
+                print(f"\U0001f527 Cast {cast_count} tensors to "
+                      f"{target_dtype if target_dtype else 'same dtype'} on {target_device}")
 
-        # Build metadata using unified factory (BUG FIX: was not being saved)
-        final_metadata = finalize_metadata(
+    @staticmethod
+    def _build_final_metadata(metadata, effective_target_format, detected_format, source_type, converted_sd):
+        """Build unified metadata dict for the output safetensors file."""
+        return finalize_metadata(
             metadata=metadata,
             mode="preserve_a",
             component="converter",
@@ -594,7 +581,9 @@ class MusubiLoraConverter:
             }
         )
 
-        # Save if requested
+    @staticmethod
+    def _handle_save(save_trigger, save_folder, filename, converted_sd, final_metadata):
+        """Save converted LoRA to safetensors file if requested. Returns save_path."""
         save_path = ""
         if save_trigger:
             try:
@@ -605,18 +594,14 @@ class MusubiLoraConverter:
                     output_folder = Path(lora_folders[0]) if lora_folders else Path.cwd()
 
                 output_folder.mkdir(parents=True, exist_ok=True)
-
-                # Add suffix based on conversion
                 base_name = filename.replace('.safetensors', '')
                 output_path = output_folder / f"{base_name}_converted.safetensors"
 
-                # Auto-increment
                 counter = 1
                 while output_path.exists():
                     output_path = output_folder / f"{base_name}_converted_{counter}.safetensors"
                     counter += 1
 
-                # Ensure all tensors are contiguous (safetensors requirement)
                 contiguous_count = 0
                 for key in list(converted_sd.keys()):
                     tensor = converted_sd[key]
@@ -624,27 +609,108 @@ class MusubiLoraConverter:
                         converted_sd[key] = tensor.contiguous()
                         contiguous_count += 1
                 if contiguous_count > 0:
-                    print(f"🔧 Made {contiguous_count} tensors contiguous for saving")
+                    print(f"\U0001f527 Made {contiguous_count} tensors contiguous for saving")
 
-                # Save WITH metadata (BUG FIX: metadata was previously missing)
                 save_file(converted_sd, str(output_path), metadata=final_metadata)
                 save_path = str(output_path)
-                print(f"💾 Saved to: {save_path}")
+                print(f"\U0001f4be Saved to: {save_path}")
 
             except Exception as e:
-                print(f"❌ Save failed: {e}")
+                print(f"\u274c Save failed: {e}")
         else:
-            print("🧠 LoRA kept in RAM, no file written")
+            print("\U0001f9e0 LoRA kept in RAM, no file written")
+        return save_path
 
-        # Create LORA tuple for output
+    @staticmethod
+    def _load_preview(model, clip, converted_sd):
+        """Load converted LoRA into model + clip for preview."""
+        preview_model = model
+        preview_clip = clip
+        if model is not None and clip is not None and converted_sd:
+            try:
+                preview_model, preview_clip = comfy.sd.load_lora_for_models(
+                    model, clip, converted_sd, 1.0, 1.0
+                )
+                print("\U0001f5bc\ufe0f LoRA preview: applied to model and clip")
+            except Exception as e:
+                print(f"\u26a0\ufe0f Failed to apply LoRA preview: {e}")
+        return preview_model, preview_clip
+
+    def convert(self, save_trigger=False, filename="converted_lora", target_format="auto",
+                precision="auto", device="auto", compression_mode="none",
+                target_rank=128, te_mode="original", te_weight=0.5,
+                bake_custom_scale=2.0, lora=None, lora_data=None,
+                model=None, clip=None, save_folder="outputs", **kwargs):
+        print("\n" + "="*50)
+        print("\U0001f504 Universal EasyLoRA Converter")
+        print("="*50)
+
+        # \u2500\u2500 0. Defensive input normalization \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+        # \u2550\u2550 Runtime precision guard \u2014 protect against stale workflow JSONs \u2550\u2550
+        if precision not in PRECISION_STANDARD:
+            print(f"   \u26a0\ufe0f Precision '{precision}' is no longer available, falling back to 'auto'")
+            precision = "auto"
+        if isinstance(target_rank, str):
+            try:
+                target_rank = int(target_rank)
+            except ValueError:
+                target_rank = 128
+                print(f"\u26a0\ufe0f target_rank could not be parsed as integer, defaulting to {target_rank}")
+        if isinstance(te_mode, str) and te_mode.lower() == 'false':
+            te_mode = 'original'
+        if compression_mode == '1' or compression_mode == 1:
+            compression_mode = 'auto-full'
+        if compression_mode == 'auto':
+            compression_mode = 'auto-full'
+
+        # \u2500\u2500 1. Resolve input source \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        sd, metadata, source_type = self._resolve_input(lora, lora_data)
+        if sd is None:
+            return (None, None, None, "", "")
+
+        # \u2500\u2500 2. Detect format + analyze structure \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        detected_format = detect_lora_format(sd)
+        print(f"\U0001f50d Detected format: {detected_format}")
+        info = self.analyze_lora_structure(sd, metadata)
+
+        # \u2500\u2500 3. Normalize to master format \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        normalized_sd, key_map = self._handle_normalization(sd, metadata, target_format)
+
+        # \u2500\u2500 4. SVD compression \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        normalized_sd, compression_info = self._handle_compression(
+            normalized_sd, compression_mode, target_rank, device, info
+        )
+
+        # \u2500\u2500 5. TE control (remove / scale) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        self._handle_te_control(normalized_sd, te_mode, te_weight)
+
+        # \u2500\u2500 6. Weight scaling \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        apply_weight_scaling = self._handle_weight_scaling(normalized_sd, bake_custom_scale)
+
+        # \u2500\u2500 7. Format conversion + alpha baking \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        converted_sd, effective_target_format, bake_alphas_flag = \
+            self._handle_format_conversion(normalized_sd, key_map, target_format, info)
+
+        # \u2500\u2500 8. Precision / device casting \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        self._handle_precision_cast(converted_sd, precision, device)
+
+        # \u2500\u2500 9. Build metadata \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        final_metadata = self._build_final_metadata(
+            metadata, effective_target_format, detected_format, source_type, converted_sd
+        )
+
+        # \u2500\u2500 10. Save to file \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        save_path = self._handle_save(save_trigger, save_folder, filename, converted_sd, final_metadata)
+
+        # \u2500\u2500 11. Build output tuple + info string \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
         lora_tuple = (converted_sd, 1.0, 1.0)
 
-        # Create info string
         source = info['primary_structure'] if info['primary_structure'] else 'unknown'
         hidden_dims_csv = ','.join(map(str, info['hidden_dims'][:3]))
         info_parts = [
             f"Source: {source}",
-            f"Keys: {len(sd)} → {len(converted_sd)}",
+            f"Keys: {len(sd)} \u2192 {len(converted_sd)}",
             f"Rank: {info['avg_rank']:.0f}",
             f"Dims: {hidden_dims_csv}",
             f"Alphas: {'baked' if bake_alphas_flag else 'kept'}"
@@ -653,32 +719,21 @@ class MusubiLoraConverter:
             info_parts.append(f"Scale: {bake_custom_scale}x")
         info_str = " | ".join(f"[{part}]" for part in info_parts)
 
-        # Add TE parameters to info for forensic report
         info['te_mode'] = te_mode
         info['te_weight'] = te_weight
         info['bake_alphas_flag'] = bake_alphas_flag
 
-        # Generate full forensic report
-        forensic_report = self._generate_forensic_report(info, target_format,
-                                                         apply_weight_scaling, bake_custom_scale,
-                                                         save_path, len(converted_sd))
+        # \u2500\u2500 12. Forensic report \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        forensic_report = self._generate_forensic_report(
+            info, target_format, apply_weight_scaling, bake_custom_scale,
+            save_path, len(converted_sd)
+        )
 
-        # Load converted LoRA into model + clip for preview (if both provided)
-        preview_model = model
-        preview_clip = clip
-        if model is not None and clip is not None and converted_sd:
-            try:
-                preview_model, preview_clip = comfy.sd.load_lora_for_models(
-                    model, clip, converted_sd, 1.0, 1.0
-                )
-                print("🖼️ LoRA preview: applied to model and clip")
-            except Exception as e:
-                print(f"⚠️ Failed to apply LoRA preview: {e}")
-                # Fall back to original model/clip on error
+        # \u2500\u2500 13. Preview (load into model + clip) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+        preview_model, preview_clip = self._load_preview(model, clip, converted_sd)
 
         print("="*50)
         return (lora_tuple, preview_model, preview_clip, save_path, forensic_report)
-
     def _parse_metadata(self, metadata):
         """Parse metadata dictionary, flatten JSON strings, and extract additional fields."""
         def flatten(obj, prefix=''):

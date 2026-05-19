@@ -1,16 +1,13 @@
 """
 Unified key categorisation and architecture detection.
 
-Consolidates 7 implementations found across the codebase:
+Consolidates key-detection implementations found across the codebase:
 
   1. ``categorize_key()``              – :file:`utils.py`
   2. ``categorize_checkpoint_key()``   – :file:`utils.py`
   3. ``_categorize_lora_key()``        – :file:`engine/baking_processor_matching.py`
   4. ``_is_te_key()``                  – :file:`engine/serialization_factory.py`
-  5. ``_is_vae_key()``                 – :file:`engine/musubi_checkpoint_studio.py`
-  6. ``_is_te_key()``                  – :file:`engine/musubi_checkpoint_studio.py`
-  7. ``_is_clip_key()``                – :file:`engine/musubi_checkpoint_studio.py`
-  8. ``detect_checkpoint_architecture`` – :file:`engine/musubi_checkpoint_studio.py` (fallback)
+  5. ``detect_checkpoint_architecture`` – :file:`engine/musubi_checkpoint_studio.py` (fallback)
 
 Usage
 -----
@@ -33,6 +30,8 @@ True
 """
 
 from typing import Iterable, Optional, Set
+
+import torch
 
 
 # ===================================================================
@@ -171,3 +170,24 @@ def detect_architecture(keys: Iterable[str]) -> str:
         if any(pattern in k for k in key_set):
             return arch
     return "Unknown"
+
+
+# ===================================================================
+# Safetensors dtype mappings
+# ===================================================================
+# These were previously duplicated in _SafetensorsStreamWriter.DTYPE_MAP and
+# _LazyCheckpointMapping._SAFETENSORS_DTYPE_MAP inside musubi_checkpoint_studio.py.
+# Extracted here to eliminate fragile cross-module coupling (baker_node.py:62-64).
+
+SAFETENSORS_DTYPE_MAP = {
+    'F64': torch.float64, 'F32': torch.float32, 'F16': torch.float16,
+    'BF16': torch.bfloat16, 'F8_E4M3': torch.float8_e4m3fn,
+    'F8_E5M2': torch.float8_e5m2, 'F8': torch.float8_e4m3fn,
+    'I64': torch.int64, 'I32': torch.int32, 'I16': torch.int16,
+    'I8': torch.int8, 'U8': torch.uint8, 'BOOL': torch.bool,
+}
+
+DTYPE_MAP = {k: (v, v.itemsize) for k, v in SAFETENSORS_DTYPE_MAP.items()}
+DTYPE_MAP_REVERSE = {v: k for k, v in SAFETENSORS_DTYPE_MAP.items()}
+# Override: force float8_e4m3fn → valid 'F8_E4M3' (not legacy 'F8' which collides and overwrites)
+DTYPE_MAP_REVERSE[torch.float8_e4m3fn] = 'F8_E4M3'

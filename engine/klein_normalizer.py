@@ -1327,6 +1327,8 @@ def universal_normalize(state_dict, metadata=None, mapping_ref=None):
         "z_image_lora_a_b": normalize_all_klein_formats,
         "flux_klein_9b": normalize_all_klein_formats,
         "flux_klein_4b": normalize_all_klein_formats,
+        "flux_klein_lora_a_b": normalize_all_klein_formats,
+        "flux_klein_lora_down_up": normalize_all_klein_formats,
         "ai_toolkit_klein": normalize_all_klein_formats,
     }
     

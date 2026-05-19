@@ -40,9 +40,41 @@ def comfyui_yield():
         time.sleep(0.001)
 
 
-def cleanup_memory(*objs):
+def read_safetensors_header_only(path: Path) -> Tuple[Dict[str, Any], Dict[str, str]]:
     """
-    Run garbage collection and clear CUDA cache.
+    Read ONLY the header JSON from a safetensors file, without loading any tensors.
+    
+    The safetensors format stores tensor metadata (names, shapes, dtypes, offsets)
+    in a JSON header at the beginning of the file. This function reads only that
+    header, avoiding the tensors themselves entirely.
+    
+    Memory: ~50 KB for a 425-key checkpoint (vs 17+ GiB for full tensor load).
+    
+    Args:
+        path: Path to the .safetensors file
+    
+    Returns:
+        (header_dict, metadata_dict) where header_dict maps tensor names to their
+        shape/dtype/data_offsets info, and metadata_dict is the __metadata__ field.
+    """
+    with open(path, 'rb') as f:
+        header_len_bytes = f.read(8)
+        if len(header_len_bytes) != 8:
+            raise ValueError(f"File too short: {path}")
+        header_len = int.from_bytes(header_len_bytes, 'little')
+        header_json_bytes = f.read(header_len)
+        if len(header_json_bytes) != header_len:
+            raise ValueError(f"Header length mismatch in {path}: expected {header_len}, got {len(header_json_bytes)}")
+        header = json.loads(header_json_bytes.decode('utf-8'))
+    
+    # Separate metadata from tensor headers
+    metadata = header.pop('__metadata__', {})
+    return header, metadata
+
+
+def cleanup_memory(*objs, skip_gc=False):
+    """
+    Run garbage collection (optional) and clear CUDA cache.
 
     NOTE: Passing objects to this function does NOT delete them from the
     caller's scope.  Python's `del obj` inside a function only deletes the
@@ -51,8 +83,15 @@ def cleanup_memory(*objs):
 
         del batch_sds, batch_mappings, merged_dict
         cleanup_memory()  # gc.collect() + torch.cuda.empty_cache()
+
+    Args:
+        skip_gc: When True, skip gc.collect() and only clear CUDA cache.
+                 Use this at the end of long pipelines where GC already ran
+                 naturally, to avoid triggering __del__ at unpredictable times
+                 (which can cause unexpected file I/O on lazy mappings).
     """
-    gc.collect()
+    if not skip_gc:
+        gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -501,6 +540,37 @@ class DeviceManager:
             if result is not None:
                 return result
             return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        elif precision in ("int8", "int8_convrot"):
+            # INT8 is universally supported on all CUDA GPUs (CC 6.1+)
+            # and CPU. No capability checks needed.
+            # int8_convrot uses the same dtype — ConvRot is a pre-processing
+            # step before quantization, not a different storage format.
+            return torch.int8
+        elif precision == "device_optimized":
+            # GPU-aware cascade: best precision THIS GPU can run natively.
+            # Same logic as the original old_gpu — optimized for the LOCAL machine.
+            if device.type == "cuda":
+                cap = torch.cuda.get_device_capability(device)
+                if cap[0] >= 9:          # Hopper+: native FP8
+                    return torch.float8_e4m3fn
+                elif cap[0] >= 8:        # Ampere+: native BF16
+                    return torch.bfloat16
+                else:                     # Pascal/Turing CC 6.1-7.5: INT8
+                    return torch.int8
+            else:
+                return torch.float32
+        elif precision == "old_gpu":
+            # Target-optimized for old GPUs (Pascal/Turing CC 6.1-7.5).
+            # Always produces INT8 (1 byte/param) with FP16 dequant —
+            # regardless of the LOCAL machine's GPU.
+            # This is the CORRECT option for creators who want to
+            # share models on CivitAI for old-GPU users.
+            return torch.int8
+        elif precision == "svd_only":
+            # SVD-only mode: apply SVD compression to float32, skip quantization.
+            # Returns float32 tensors with reduced rank (smaller file size).
+            # No companion scales, no quantization metadata needed.
+            return torch.float32
         else:  # "auto"
             if device.type == "cuda":
                 # Auto-select best precision
@@ -551,7 +621,9 @@ def _try_fp8_dtype(dtype_attr: str, label: str, device: torch.device) -> Optiona
             print("   Will attempt FP8 but fall back to bfloat16 if operations fail")
             return getattr(torch, dtype_attr)
         else:
-            print(f"⚠️ {label} not supported on device (compute {device_cap}), falling back to bfloat16")
+            # BF16 requires CC 8.0+ (Ampere); on older GPUs the caller will fall back to FP16
+            _fallback = "bfloat16" if device_cap[0] >= 8 else "float16"
+            print(f"⚠️ {label} not supported on device (compute {device_cap}), falling back to {_fallback}")
     else:
         print(f"⚠️ {label} not available in this PyTorch version, falling back to bfloat16")
     return None
@@ -642,7 +714,7 @@ def estimate_ram_mode_peak(total_data_size: int, num_tensors: int, batch_size: i
     """
     Estimate peak memory for in-memory modes.
     
-    Peak depends on which mode is active:
+    Peak depends on which output mode is active:
     - Dict mode (use_dict=True): ~1.5x total_data_size
       No BytesIO/clone overhead — state dict IS the merge output.
       During weave: output dict grows to ~1x total_data_size (system RAM).
@@ -652,12 +724,9 @@ def estimate_ram_mode_peak(total_data_size: int, num_tensors: int, batch_size: i
       when state dict is partially consumed and model objects partially built.
       When precision=bf16/fp16, dict uses ~half the fp32 memory.
       Phase 3 (zero-weight auto-omit) further reduces dict size proportionally.
-    - Legacy buffer mode (use_buffer=True): ~2x total_data_size
-      Phase 1 (parse): buffer (~1x) + growing state dict (~0.5x partial) = ~1.5x
-      Phase 2 (del writer -> ComfyUI load): state dict (~1x) + model objects (~1x) = ~2x
     - Batch processing during weave: negligible vs parse/load phases
     
-    We conservatively estimate 2x for legacy buffer mode, 1.5x for dict mode,
+    We conservatively estimate 1.5x for dict mode,
     plus batch overhead. Dict mode users get ~25% lower estimate automatically
     (more with low-precision or zero-weight omission), reducing unnecessary
     fallbacks to disk mode on moderately RAM-constrained systems.
@@ -674,7 +743,7 @@ def estimate_ram_mode_peak(total_data_size: int, num_tensors: int, batch_size: i
         # Conservative: 1.5x accounts for partial system RAM overlap.
         operation_peak = int(total_data_size * 1.5)
     else:
-        # Legacy buffer mode: BytesIO (~1x) + state_dict (~1x) + model objects (~1x)
+        # Streaming mode (no BytesIO buffer): state_dict (~1x) + model objects (~1x)
         # can briefly coexist during parse+load on system RAM. Conservative: 2x.
         operation_peak = int(total_data_size * 2.0)
     
@@ -727,6 +796,33 @@ def check_ram_guard(
     else:
         print(f"✅ RAM Guard ({label}): Peak estimate within safe limits")
         return True
+
+
+def print_ram_delta(
+    pre_ram: Optional[int],
+    post_ram: Optional[int],
+    label: str = "load"
+) -> None:
+    """Print pre/post RAM delta with consistent formatting emoji prefix.
+
+    Baker reference: baker_node.py:450 + baker_node.py:607-614.
+    """
+    if pre_ram is not None and post_ram is not None:
+        delta_gb = (pre_ram - post_ram) / (1024**3)
+        print(f"📊 RAM: Pre-{label} {pre_ram/(1024**3):.2f} GB \u2192 "
+              f"Post-{label} {post_ram/(1024**3):.2f} GB "
+              f"(delta: {delta_gb:+.2f} GB)")
+    elif post_ram is not None:
+        print(f"📊 Post-{label} available RAM: {post_ram/(1024**3):.2f} GB")
+
+
+def is_lazy_mapping(obj) -> bool:
+    """Detect if object is a _LazyCheckpointMapping (mmap-backed).
+
+    Used to skip RAM Guard for mmap-backed mappings.
+    Baker reference: baker_node.py:523, baking_processor.py:278, 691.
+    """
+    return hasattr(obj, 'filepath')
 
 
 def estimate_disk_mode_peak(total_data_size: int, num_tensors: int, batch_size: int) -> int:
@@ -821,13 +917,12 @@ class ThreadSafeCleanup:
 
 
 def get_experiment_temp_path(node_type: str = "main") -> Path:
-    """Get temp path with cleanup."""
-    # Run cleanup in background thread
-    cleanup_thread = threading.Thread(target=ThreadSafeCleanup.cleanup_temp_directory)
-    cleanup_thread.daemon = True
-    cleanup_thread.start()
-    
-    # Create path
+    """Get a temp file path AND auto-register it with ThreadSafeCleanup.
+
+    Every temp file created through this function is automatically
+    registered for cleanup — callers should NOT register it again.
+    Uses the ``easy_lora`` subdirectory under ComfyUI's temp directory.
+    """
     temp_dir = Path(folder_paths.get_temp_directory()) / "easy_lora"
     temp_dir.mkdir(parents=True, exist_ok=True)
     
@@ -839,7 +934,9 @@ def get_experiment_temp_path(node_type: str = "main") -> Path:
     else:
         filename = f"experiment_only_{timestamp}_{random_str}.safetensors"
     
-    return temp_dir / filename
+    path = temp_dir / filename
+    ThreadSafeCleanup.register_temp_file(path)
+    return path
 
 
 def _get_output_path(
@@ -930,7 +1027,7 @@ def get_checkpoint_output_path(save_folder: str, filename: str) -> Path:
 _DTYPE_SIZE = {
     "F64": 8, "F32": 4, "F16": 2, "BF16": 2,
     "I64": 8, "I32": 4, "I16": 2, "I8": 1, "U8": 1,
-    "F8": 1, "BOOL": 1,
+    "F8_E4M3": 1, "F8_E5M2": 1, "BOOL": 1,
 }
 
 DTYPE_REVERSE_STREAM = {
@@ -939,8 +1036,8 @@ DTYPE_REVERSE_STREAM = {
     torch.int64: "I64",   torch.int32: "I32",
     torch.int16: "I16",   torch.int8: "I8",
     torch.uint8: "U8",
-    torch.float8_e4m3fn: "F8",
-    torch.float8_e5m2: "F8",
+    torch.float8_e4m3fn: "F8_E4M3",
+    torch.float8_e5m2: "F8_E5M2",
     torch.bool: "BOOL",
 }
 
@@ -990,6 +1087,8 @@ def save_safetensors_stream(
         RuntimeError: On write failure after partial file creation.
     """
     # Phase 1: Build header and compute cumulative offsets
+    # NOTE: BFL original files store tensors contiguously with NO padding.
+    # We match that layout exactly — no 8-byte alignment padding.
     sorted_keys = sorted(tensors.keys())
     header: Dict[str, Any] = {"__metadata__": metadata or {}}
     offset = 0
@@ -1005,7 +1104,7 @@ def save_safetensors_stream(
             "shape": shape,
             "data_offsets": [offset, offset + data_size],
         }
-        offset += data_size
+        offset += data_size  # no padding — matches BFL's contiguous layout
 
     # Phase 2: Serialize to file, one tensor at a time
     header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
@@ -1017,7 +1116,24 @@ def save_safetensors_stream(
             f.write(header_bytes)
             for key in sorted_keys:
                 tensor = tensors[key]
-                f.write(_tensor_to_bytes(tensor))
+                raw_bytes = _tensor_to_bytes(tensor)
+                f.write(raw_bytes)
+                # No padding — tensors stored contiguously (BFL-compatible)
+
+        # Phase 3: Validate file with safe_open — catches corruption immediately
+        try:
+            with safe_open(filename, framework="pt") as sf:
+                for key in sf.keys():
+                    _ = sf.get_tensor(key)  # triggers offset validation
+        except Exception as e:
+            # Validation failed — delete corrupted file and re-raise
+            try:
+                Path(filename).unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Post-save validation failed for {filename}: {e}"
+            ) from e
     except BaseException:
         # Clean up partial file — catch BaseException to handle
         # KeyboardInterrupt (Ctrl+C) during long writes
@@ -1162,47 +1278,6 @@ def silent_pad_or_truncate(tensor: torch.Tensor, target_rank: int, key: str) -> 
 
     return new_tensor
 
-
-def save_lora_data_to_temp(lora_data, name: str) -> Optional[Path]:
-    """Save LORA data tuple to temporary safetensors file."""
-    if lora_data is None:
-        return None
-    
-    try:
-        lora_dict, _, _ = lora_data
-        temp_dir = Path(folder_paths.get_temp_directory())
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Create secure temp filename
-        temp_filename = f"temp_{name}_{uuid.uuid4().hex}.safetensors"
-        temp_path = temp_dir / temp_filename
-        
-        # Validate before saving
-        if not isinstance(lora_dict, dict):
-            raise ValueError("LORA data must be a dictionary")
-        
-        save_file(lora_dict, str(temp_path))
-        return temp_path
-    except Exception as e:
-        print(f"❌ Failed to save temp LORA data: {e}")
-        return None
-
-
-def save_checkpoint_data_to_temp(state_dict, name: str, metadata=None) -> Optional[Path]:
-    """Save a checkpoint state dict to a temporary safetensors file (for chaining/preview)."""
-    if state_dict is None:
-        return None
-    try:
-        temp_dir = Path(folder_paths.get_temp_directory())
-        temp_dir.mkdir(parents=True, exist_ok=True)
-        temp_filename = f"checkpoint_temp_{name}_{uuid.uuid4().hex}.safetensors"
-        temp_path = temp_dir / temp_filename
-        save_file(state_dict, str(temp_path), metadata=metadata or {})
-        ThreadSafeCleanup.register_temp_file(temp_path)
-        return temp_path
-    except Exception as e:
-        print(f"❌ Failed to save checkpoint temp file: {e}")
-        return None
 
 def bake_alphas(state_dict, naming_style='lora_a_b'):
     """

@@ -27,9 +27,13 @@ from .utils import (
     get_free_disk_space,
     ProgressTracker,
 )
-from .config import PRECISION_OPTIONS, DEVICE_OPTIONS
+from .config import PRECISION_EXTENDED, DEVICE_OPTIONS
 from .engine.methods import resolve_blend_mode_triple
-from .engine.checkpoint_weaver import CheckpointTripleStreamWriter
+from .engine.checkpoint_weaver import CheckpointTripleMerger
+from .engine.fp8_quantizer import (
+    build_fp8_quantization_metadata as _build_fp8_quantization_metadata,
+    strip_input_scale_keys as _strip_input_scale_keys,
+)
 
 
 # ── Named constants ──────────────────────────────────────────────────
@@ -133,7 +137,7 @@ class EasyCheckpointMerger:
 
                 # ── SECTION 5: HARDWARE ─────────────────────────────────
                 "device": (DEVICE_OPTIONS, {"default": "auto"}),
-                "precision": (PRECISION_OPTIONS, {"default": "auto"}),
+                "precision": (PRECISION_EXTENDED, {"default": "auto"}),
                 "batch_size": ("INT", {"default": 64, "min": 1, "max": 256, "step": 8,
                     "tooltip": "Number of keys to process per batch. "
                                "DeviceManager.suggest_batch_size() can auto-tune based on VRAM."}),
@@ -224,6 +228,13 @@ class EasyCheckpointMerger:
         print("\n" + "="*60)
         print("🎨 Easy Checkpoint Merger")
         print("="*60)
+        _T0 = time.time()
+        print(f"   🕐 [t={0.0:.1f}s] merge_triple start")
+        
+        # ══ Runtime precision guard — protect against stale workflow JSONs ══
+        if precision not in PRECISION_EXTENDED:
+            print(f"   ⚠️ Precision '{precision}' is no longer available, falling back to 'auto'")
+            precision = "auto"
         
         # ── Collect source paths and in-memory dicts ──
         # When a data input (checkpoint_data_*) is connected, pass the dict directly
@@ -310,16 +321,16 @@ class EasyCheckpointMerger:
         
         # ── Create streaming writer and initial survey (populate tensor_list) ──
         print("📋 Surveying checkpoint headers...")
-        writer = CheckpointTripleStreamWriter(
+        writer = CheckpointTripleMerger(
             source_paths=source_paths,
             output_path=output_path,
             merge_config=merge_config,
             metadata_options=metadata_options,
             use_dict=_use_dict,
-            use_buffer=False,
             source_dicts=source_dicts if any(d is not None for d in source_dicts) else None,
         )
         writer.survey()  # Initial survey WITHOUT pbar (tensor_list needed for RAM guard)
+        print(f"   🕐 [t={time.time()-_T0:.1f}s] Survey complete — {len(writer.tensor_list)} tensors")
         
         # ── RAM Safety Guard: check available memory before weave ──
         total_bytes = sum(t["size"] for t in writer.tensor_list)
@@ -333,13 +344,12 @@ class EasyCheckpointMerger:
             print(f"   ℹ️  Auto-falling back to disk mode for low-RAM safety")
             print(f"   ⚠️  Re-surveying: reading all checkpoint headers again (I/O overhead)")
             _use_dict = False
-            writer = CheckpointTripleStreamWriter(
+            writer = CheckpointTripleMerger(
                 source_paths=source_paths,
                 output_path=output_path,
                 merge_config=merge_config,
                 metadata_options=metadata_options,
                 use_dict=False,
-                use_buffer=False,
                 source_dicts=source_dicts if any(d is not None for d in source_dicts) else None,
             )
             writer.survey()  # Re-survey without pbar (fallback path)
@@ -383,6 +393,7 @@ class EasyCheckpointMerger:
             writer.weave(pbar=pbar)
         finally:
             pbar.__exit__(None, None, None)
+        print(f"   🕐 [t={time.time()-_T0:.1f}s] Weave complete — merged {len(writer.tensor_list)} tensors")
         
         # ── Generate forensic report ──
         forensic_report = writer.generate_forensic_report()
@@ -391,12 +402,33 @@ class EasyCheckpointMerger:
         # ── Capture merged_metadata BEFORE deleting the writer ──
         merged_metadata = writer.merged_metadata
         
+        # ── FP8 EXPORT: Detect if output is FP8 ──
+        # The engine (checkpoint_weaver.py) emits companion scale slots during
+        # survey() and quantizes to FP8 during weave(). The _quantization_metadata
+        # was conditionally kept in survey() (not stripped when target is FP8),
+        # but we still need to build fresh metadata from the output state dict
+        # because the source metadata may describe INPUT FP8 quantization, not
+        # the freshly-quantized OUTPUT.
+        _is_fp8_output = writer.target_dtype_str in ("F8_E4M3", "F8_E5M2")
+        if _is_fp8_output:
+            print(f"   🎯 FP8 output detected: {writer.target_dtype_str}")
+        
         # ── Measure pre-output available RAM for post-merge comparison ──
         _pre_avail_ram = get_available_ram()
         
         # ── Load merged model objects (both save_trigger True and False) ──
         if _use_dict:
             state_dict = writer.get_output_dict()
+            
+            # ── FP8 EXPORT: Strip .input_scale and inject _quantization_metadata ──
+            # MixedPrecisionOps only needs .weight_scale — .input_scale keys
+            # appear as "unexpected" when loading from dict. Build fresh metadata
+            # by scanning the output state dict for FP8 tensor dtypes.
+            if _is_fp8_output:
+                _strip_input_scale_keys(state_dict)
+                merged_metadata = _build_fp8_quantization_metadata(
+                    state_dict, merged_metadata, label="checkpoint_merger"
+                )
             
             if save_trigger:
                 # ── Save to disk + load model (save + preview) ──
@@ -438,6 +470,7 @@ class EasyCheckpointMerger:
                         output_vae=True,
                         output_clip=True
                     )
+                    print(f"   🕐 [t={time.time()-_T0:.1f}s] Model loading complete (save path)")
                 except Exception as e:
                     print(f"⚠️ Failed to load state dict as model objects: {e}")
                     model, clip, vae = None, None, None
@@ -466,6 +499,7 @@ class EasyCheckpointMerger:
                         output_vae=True,
                         output_clip=True
                     )
+                    print(f"   🕐 [t={time.time()-_T0:.1f}s] Model loading complete (preview path)")
                 except Exception as e:
                     print(f"⚠️ Failed to load state dict as model objects: {e}")
                     model, clip, vae = None, None, None
@@ -484,6 +518,22 @@ class EasyCheckpointMerger:
             # Always load model via lazy mapping from saved file
             print(f"📥 Loading merged checkpoint from file into ComfyUI...")
             from .engine.musubi_checkpoint_studio import MusubiCheckpointStudio
+            
+            # ── FP8 EXPORT: Inject _quantization_metadata for disk fallback mode ──
+            # The file was written by weave() with survey() metadata. For FP8 output,
+            # build fresh quantization metadata by scanning the file header via
+            # the lazy mapping (reads header JSON, not tensor data).
+            if _is_fp8_output:
+                # Create a temp lazy mapping just for header scan, then overwrite
+                _temp_lazy = MusubiCheckpointStudio._LazyCheckpointMapping(
+                    output_path, merged_metadata
+                )
+                merged_metadata = _build_fp8_quantization_metadata(
+                    _temp_lazy, merged_metadata, label="disk_fallback"
+                )
+                _temp_lazy.permanent_close()
+                del _temp_lazy
+            
             lazy_mapping = MusubiCheckpointStudio._LazyCheckpointMapping(
                 output_path, merged_metadata
             )
@@ -494,12 +544,13 @@ class EasyCheckpointMerger:
                     output_vae=True,
                     output_clip=True
                 )
+                print(f"   🕐 [t={time.time()-_T0:.1f}s] Model loading complete (disk fallback path)")
             except Exception as e:
                 print(f"⚠️ Failed to load state dict as model objects: {e}")
                 model, clip, vae = None, None, None
-            checkpoint_data = None
-        
-        # ── Measure post-merge available RAM and print delta ──
+        checkpoint_data = None
+    
+    # ── Measure post-merge available RAM and print delta ──
         _post_avail_ram = get_available_ram()
         if _pre_avail_ram is not None and _post_avail_ram is not None:
             _delta_gb = (_pre_avail_ram - _post_avail_ram) / (1024**3)
@@ -508,5 +559,7 @@ class EasyCheckpointMerger:
                   f"(delta: {_delta_gb:+.2f} GB)")
         elif _post_avail_ram is not None:
             print(f"📊 Post-merge available RAM: {_post_avail_ram / (1024**3):.2f} GB")
+        
+        print(f"   🕐 [t={time.time()-_T0:.1f}s] merge_triple returning")
         
         return (model, clip, vae, checkpoint_data, save_path_str, forensic_report)

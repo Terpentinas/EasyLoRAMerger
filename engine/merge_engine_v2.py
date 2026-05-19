@@ -194,6 +194,9 @@ class IdentityMergeEngine:
         # Ensure target dtype is supported by hardware (if not, fallback)
         if target_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
             target_dtype = torch.float16
+        # If device is CPU, prefer float32 over bfloat16 for compatibility
+        if target_dtype == torch.bfloat16 and self.device.type == 'cpu':
+            target_dtype = torch.float32
         # If target dtype differs from current self.dtype, update it
         if target_dtype != self.dtype:
             print(f"   🔄 Auto‑precision adjusted: {self.dtype} → {target_dtype}")
@@ -895,6 +898,7 @@ class IdentityMergeEngine:
                     # Merge using universal_merge_executor
                     merged_tensor = universal_merge_executor(
                         method, tensor_a, tensor_b, weight_a, weight_b,
+                        device=self.device,
                         blend_mode=resolved_blend_mode,
                         uniqueness=self.config.uniqueness,
                         threshold=self.config.threshold,
