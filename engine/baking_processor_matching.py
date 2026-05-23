@@ -21,6 +21,7 @@ from .baking_processor_constants import (
 )
 from .baking_processor_baking import _check_shape_compatible
 from .baking_processor_delta import _LazyDeltaDict, _MatchedDeltas, _ShapeInfo
+from .key_mapper import build_lora_key_variants
 
 
 def _strip_tensor_suffix(key: str) -> str:
@@ -294,355 +295,38 @@ def _try_deterministic_te_mapping(
 # ===================================================================
 # Strategy 0: Reverse Key Map (ComfyUI-native, exhaustive)
 # ===================================================================
+# Delegates to engine.key_mapper.build_lora_key_variants() — the single
+# authoritative source for ALL checkpoint → LoRA key variant generation.
+# This replaces the previous ~350-line manual implementation.
 
 def _build_reverse_key_map(ckpt_sd: Dict[str, torch.Tensor]) -> Dict[str, str]:
     """
-    Build a reverse key map: for each possible LoRA key variant, map it
-    to the corresponding checkpoint base key (without .weight suffix).
+    Build a reverse key map using the shared :func:`build_lora_key_variants`.
 
-    This mirrors ComfyUI's model_lora_keys_unet() and model_lora_keys_clip()
-    logic. For each checkpoint key, it generates ALL known LoRA naming
-    variants and registers them in the map.
+    For each unique checkpoint base key, generates ALL known LoRA naming
+    variants via :func:`~engine.key_mapper.build_lora_key_variants` and
+    registers them in the map::
 
-    Architecture support:
-      - SDXL UNet (model.diffusion_model.input_blocks.*)
-      - SDXL TE1 (cond_stage_model.transformer.text_model.*)
-      - SDXL TE2 (conditioner.embedders.*.transformer.text_model.*)
-      - SD1.5 UNet (model.diffusion_model.input_blocks.*)
-      - SD1.5 TE (cond_stage_model.transformer.text_model.*)
-      - Flux (model.diffusion_model.transformer.double_blocks.* / single_blocks.*)
-      - Z-Image / Musubi (model.diffusion_model.layers.*)
-      - Anima (model.* with long block prefixes)
+        lora_key_variant → ckpt_base_key (without .weight/.bias/.alpha suffix)
+
+    Args:
+        ckpt_sd: Checkpoint state dict.
 
     Returns:
-        Dict mapping lora_key_variant -> ckpt_base_key (without .suffix)
+        Dict mapping lora_key_variant → ckpt_base_key.
     """
     reverse_map: Dict[str, str] = {}
 
-    # Pre-process: collect all base keys (without .weight/.bias/.alpha suffix)
-    ckpt_bases: List[str] = []
-    for k in ckpt_sd.keys():
+    # Collect unique base keys (without .weight/.bias/.alpha suffix)
+    for k in ckpt_sd:
         base = _strip_tensor_suffix(k)
-        if base not in ckpt_bases:
-            ckpt_bases.append(base)
+        if base in reverse_map:
+            continue  # already processed
 
-    # ================================================================
-    # Section 1: Standard SDXL UNet entries (model.diffusion_model.*)
-    # ================================================================
-    for base_key in ckpt_bases:
-        # Skip non-UNet keys early
-        if not base_key.startswith('model.diffusion_model.'):
-            continue
-
-        # Strip the 'model.' prefix to get the inner path
-        inner = base_key[len('model.'):]  # diffusion_model.input_blocks.3.1.attn1.to.k
-
-        # Register direct variant (diffusion_model.*)
-        reverse_map[inner] = base_key
-
-        # Register without any prefix (pure path)
-        pure_path = inner[len('diffusion_model.'):]  # input_blocks.3.1.attn1.to.k
-        reverse_map[pure_path] = base_key
-
-        # Register 'lora_unet_' prefix variant (Kohya style)
-        reverse_map[f"lora_unet_{pure_path}"] = base_key
-
-        # Also try underscore variant for the pure path
-        underscorized = pure_path.replace('.', '_')
-        if underscorized != pure_path:
-            reverse_map[underscorized] = base_key
-            reverse_map[f"lora_unet_{underscorized}"] = base_key
-
-
-    # ================================================================
-    # Section 2a: SDXL / SD1.5 TE entries (cond_stage_model.transformer.*)
-    # ================================================================
-    for base_key in ckpt_bases:
-        if not base_key.startswith('cond_stage_model.transformer.'):
-            continue
-
-        inner = base_key[len('cond_stage_model.'):]  # transformer.text_model.encoder.layers.0...
-        pure_te = base_key[len('cond_stage_model.transformer.'):]  # text_model.encoder.layers.0...
-
-        # SD1.5: text_model.* → direct
-        reverse_map[pure_te] = base_key
-        reverse_map[inner] = base_key
-
-        # Kohya: lora_te_ prefix
-        reverse_map[f"lora_te_{pure_te}"] = base_key
-        reverse_map[f"lora_te1_{pure_te}"] = base_key
-
-        # te. prefix, te1. prefix
-        reverse_map[f"te.{pure_te}"] = base_key
-        reverse_map[f"te1.{pure_te}"] = base_key
-
-        # Underscore variants
-        underscorized = pure_te.replace('.', '_')
-        if underscorized != pure_te:
-            reverse_map[underscorized] = base_key
-            reverse_map[f"lora_te_{underscorized}"] = base_key
-            reverse_map[f"lora_te1_{underscorized}"] = base_key  # ← Item 4: missing te1 variant
-
-    # ================================================================
-    # Section 2a-ii: CLIP-L / CLIP-G text encoder entries
-    # SDXL dual-TE: clip_l.text_model.* and clip_g.text_model.*
-    # ================================================================
-    for base_key in ckpt_bases:
-        if not base_key.startswith(('clip_l.text_model.', 'clip_g.text_model.')):
-            continue
-
-        # clip_l.text_model.encoder.layers.0.self_attn.k_proj
-        pure_clip = base_key[len('clip_l.'):]  # text_model.encoder.layers.0...
-
-        # Direct: text_model.* (shared with Section 2a pure_te path)
-        reverse_map[pure_clip] = base_key
-
-        # lora_te_ prefix (some trainers use lora_te_clip_l_text_model_...)
-        reverse_map[f"lora_te_{pure_clip}"] = base_key
-
-        # te. prefix
-        reverse_map[f"te.{pure_clip}"] = base_key
-
-        # Original prefix variants
-        reverse_map[base_key] = base_key
-
-        # lora_te_clip_l_ / lora_te_clip_g_ prefix variant
-        clip_prefix = base_key.split('.')[0]  # clip_l or clip_g
-        reverse_map[f"lora_te_{clip_prefix}_{pure_clip}"] = base_key
-
-        # Underscore variants
-        underscorized = pure_clip.replace('.', '_')
-        if underscorized != pure_clip:
-            reverse_map[underscorized] = base_key
-            reverse_map[f"lora_te_{underscorized}"] = base_key
-
-    # ================================================================
-    # Section 2b: SDXL TE2 entries (conditioner.embedders.*)
-    # ================================================================
-    for base_key in ckpt_bases:
-        if not base_key.startswith('conditioner.embedders.'):
-            continue
-
-        # Extract embedder index
-        # conditioner.embedders.0.transformer.text_model.encoder.layers.0.self_attn.k_proj
-        parts = base_key.split('.')
-        if len(parts) >= 4 and parts[2].isdigit():
-            embedder_idx = parts[2]
-            inner_key = '.'.join(parts[3:])  # transformer.text_model.encoder.layers.0...
-            pure_te2 = '.'.join(parts[4:])  # text_model.encoder.layers.0...
-
-            # Direct: conditioner.embedders.N.* → conditioner.embedders.N.*
-            reverse_map[f"conditioner.embedders.{embedder_idx}.{inner_key}"] = base_key
-
-            # te2. prefix
-            reverse_map[f"te2.{pure_te2}"] = base_key
-
-            # te1. prefix (some SDXL LoRAs use te1. for the first embedder)
-            reverse_map[f"te1.{pure_te2}"] = base_key
-
-            # lora_te2_ prefix
-            reverse_map[f"lora_te2_{pure_te2}"] = base_key
-
-            # conditioner prefix (without embedder index — generic)
-            reverse_map[f"conditioner.{inner_key}"] = base_key
-
-    # ================================================================
-    # Section 2c: T5 text encoder entries (t5xxl.transformer.*)
-    # Used by Flux and other architectures with T5 text encoder.
-    # ================================================================
-    for base_key in ckpt_bases:
-        if not base_key.startswith('t5xxl.transformer.'):
-            continue
-
-        # t5xxl.transformer.encoder.layers.0.self_attn.k_proj
-        # Strip 't5xxl.' prefix to get the transformer path
-        inner = base_key[len('t5xxl.'):]  # transformer.encoder.layers.0.self_attn.k_proj
-
-        # Direct: transformer.encoder.layers.*
-        reverse_map[inner] = base_key
-
-        # Pure path without transformer prefix: encoder.layers.0.self_attn.k_proj
-        pure_t5 = base_key[len('t5xxl.transformer.'):]  # encoder.layers.0.self_attn.k_proj
-        reverse_map[pure_t5] = base_key
-
-        # lora_te_ prefix variant
-        reverse_map[f"lora_te_{pure_t5}"] = base_key
-
-        # te. prefix variant (some trainers use te.t5xxl.transformer.*)
-        reverse_map[f"te.{pure_t5}"] = base_key
-
-        # Underscore variants
-        underscorized = pure_t5.replace('.', '_')
-        if underscorized != pure_t5:
-            reverse_map[underscorized] = base_key
-            reverse_map[f"lora_te_{underscorized}"] = base_key
-            reverse_map[f"te_{underscorized}"] = base_key
-
-    # ================================================================
-    # Section 3: Flux entries (model.diffusion_model.transformer.*)
-    # ================================================================
-    for base_key in ckpt_bases:
-        if not base_key.startswith('model.diffusion_model.transformer.'):
-            continue
-
-        inner = base_key[len('model.diffusion_model.'):]  # transformer.double_blocks.0.attn.to_q
-
-        # Direct: transformer.*
-        reverse_map[inner] = base_key
-
-        # Strip 'model.diffusion_model.' prefix
-        pure_flux = base_key[len('model.diffusion_model.transformer.'):]  # double_blocks.0.attn.to_q
-        reverse_map[pure_flux] = base_key
-
-        # lora_unet_ prefix
-        reverse_map[f"lora_unet_{pure_flux}"] = base_key
-        # lora_unet_transformer.* variant (rare Kohya/Flux convention)
-        reverse_map[f"lora_unet_transformer.{pure_flux}"] = base_key
-
-        # Flux Klein convention: model.diffusion_model.transformer. → (some use different prefixes)
-        # Klein models may use 'transformer.' directly
-        reverse_map[f"transformer.{pure_flux}"] = base_key
-
-    # ================================================================
-    # Section 4: Z-Image / Musubi entries (model.diffusion_model.layers.*)
-    # ================================================================
-    for base_key in ckpt_bases:
-        if not base_key.startswith('model.diffusion_model.layers.'):
-            continue
-
-        inner = base_key[len('model.diffusion_model.'):]  # layers.0.attention.to_q
-        pure_zi = base_key[len('model.diffusion_model.layers.'):]  # 0.attention.to_q
-
-        # Direct: layers.*
-        reverse_map[inner] = base_key
-        reverse_map[pure_zi] = base_key
-
-        # lora_unet_ prefix
-        reverse_map[f"lora_unet_{inner}"] = base_key
-        reverse_map[f"lora_unet_layers_{pure_zi}"] = base_key
-
-    # ================================================================
-    # Section 4b: Bare Z-Image / Musubi entries (layers.* without model prefix)
-    # Some LoRAs may skip the model.diffusion_model prefix entirely for Z-Image
-    # ================================================================
-    for base_key in ckpt_bases:
-        if not base_key.startswith('layers.'):
-            continue
-        # Already registered by Section 4?
-        # But catch keys that are NOT under model.diffusion_model.layers
-        # e.g., standalone 'layers.0.attention.to_q'
-        reverse_map[base_key] = base_key
-
-    # ================================================================
-    # Section 4c: Flux transformer entries (transformer.double_blocks.*, transformer.single_blocks.*)
-    # Flux checkpoints use bare transformer.* keys without model.diffusion_model prefix.
-    # These need to be registered so LoRA keys (which may have diffusion_model. prefix
-    # after normalization) can find their checkpoint counterparts.
-    # ================================================================
-    for base_key in ckpt_bases:
-        if not base_key.startswith('transformer.'):
-            continue
-        
-        # Register bare key (for LoRAs that use raw Flux key naming)
-        reverse_map[base_key] = base_key
-        
-        # Register with model.diffusion_model prefix (for LoRAs normalized to ComfyUI format)
-        reverse_map[f"model.diffusion_model.{base_key}"] = base_key
-        
-        # Register with diffusion_model prefix (shorthand variant)
-        reverse_map[f"diffusion_model.{base_key}"] = base_key
-        
-        # Also register 'lora_unet_' prefix variant for ComfyUI-style LoRA keys
-        pure_path = base_key[len('transformer.'):]  # double_blocks.0.img_attn.qkv
-        reverse_map[f"lora_unet_{pure_path}"] = base_key
-
-    # ================================================================
-    # Section 4d: Flux keys with diffusion_model.{pure_path} prefix (Klein normalized format)
-    # After identity_normalize() → normalize_all_klein_formats(), Flux Klein LoRA
-    # keys use diffusion_model.double_blocks.* / diffusion_model.single_blocks.*
-    # format (without transformer. sub-path). Map these to the checkpoint's
-    # transformer.double_blocks.* / transformer.single_blocks.* keys.
-    #
-    # Example:
-    #   LoRA (normalized):  diffusion_model.double_blocks.0.img_attn.qkv
-    #   Checkpoint:         transformer.double_blocks.0.img_attn.qkv
-    #   Reverse map entry:  diffusion_model.double_blocks.0.img_attn.qkv
-    #                       → transformer.double_blocks.0.img_attn.qkv
-    #
-    # NOTE: This only applies to vanilla Flux checkpoints that use the
-    #       transformer. prefix. For Klein checkpoints which use bare
-    #       double_blocks.* / single_blocks.* keys, see Section 4e below.
-    # ================================================================
-    for base_key in ckpt_bases:
-        if not base_key.startswith('transformer.'):
-            continue
-        pure_path = base_key[len('transformer.'):]  # double_blocks.0.img_attn.qkv
-        
-        # Map diffusion_model.{pure_path} (Klein normalized format)
-        reverse_map[f"diffusion_model.{pure_path}"] = base_key
-        
-        # Map model.diffusion_model.{pure_path} (full prefix variant)
-        reverse_map[f"model.diffusion_model.{pure_path}"] = base_key
-
-    # ================================================================
-    # Section 4e: Flux bare double_blocks/single_blocks keys (Klein 4B/9B format)
-    # Klein checkpoints store keys WITHOUT the transformer. prefix, using bare
-    # double_blocks.* / single_blocks.* format. Normalized LoRA keys use
-    # diffusion_model.double_blocks.* / diffusion_model.single_blocks.* which
-    # need to map to these bare checkpoint keys.
-    #
-    # Example:
-    #   LoRA (normalized):  diffusion_model.double_blocks.0.img_attn.qkv
-    #   Checkpoint:         double_blocks.0.img_attn.qkv
-    #   Reverse map entry:  diffusion_model.double_blocks.0.img_attn.qkv
-    #                       → double_blocks.0.img_attn.qkv
-    # ================================================================
-    for base_key in ckpt_bases:
-        if not base_key.startswith(('double_blocks.', 'single_blocks.')):
-            continue
-        
-        # Map diffusion_model.{base_key} (Klein normalized LoRA format)
-        reverse_map[f"diffusion_model.{base_key}"] = base_key
-        
-        # Map model.diffusion_model.{base_key} (full prefix variant)
-        reverse_map[f"model.diffusion_model.{base_key}"] = base_key
-        
-        # Map lora_unet_{base_key} (ComfyUI-style LoRA key format)
-        reverse_map[f"lora_unet_{base_key}"] = base_key
-
-    # ================================================================
-    # Section 5: Bare layers (generic fallback for un-prefixed keys)
-    # ================================================================
-    # Handle keys that don't have any standard prefix
-    for base_key in ckpt_bases:
-        if base_key.startswith(('model.', 'diffusion_model.', 'cond_stage_model.',
-                                'conditioner.', 'transformer.', 'layers.',
-                                'double_blocks.', 'single_blocks.')):
-            continue
-
-        # Bare key: register as-is
-        reverse_map[base_key] = base_key
-
-    # ================================================================
-    # Section 6: Anima block entries (long block prefixes)
-    # ================================================================
-    for base_key in ckpt_bases:
-        # Anima blocks use long descriptive prefixes that don't fit
-        # standard patterns. They're typically registered as bare keys
-        # by Section 5, but we also add lora_unet_ variants.
-        if base_key.startswith('model.diffusion_model.'):
-            inner = base_key[len('model.diffusion_model.'):]
-            if not inner.startswith(('input_blocks.', 'output_blocks.', 'middle_block.',
-                                     'transformer.', 'layers.')):
-                # Anima-style block path
-                reverse_map[f"lora_unet_{inner}"] = base_key
-
-    # ================================================================
-    # Additional: Anima llm_adapter entries
-    # ================================================================
-    for base_key in ckpt_bases:
-        if 'llm_adapter' in base_key or 'llama' in base_key:
-            reverse_map[base_key] = base_key
+        # Generate all known LoRA variants for this checkpoint key
+        variants = build_lora_key_variants(base)
+        for variant in variants:
+            reverse_map[variant] = base
 
     return reverse_map
 

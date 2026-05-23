@@ -29,6 +29,8 @@ from ..utils import (
     save_safetensors_stream,
     cleanup_memory,
     NodeCache,
+    get_combined_model_list,
+    resolve_model_path,
 )
 from ..config import PRECISION_EXTENDED, DEVICE_OPTIONS, DevicePrecisionConfig
 from .key_utils import categorize_key
@@ -238,7 +240,7 @@ class EasyComponentExtractor:
 
     @classmethod
     def INPUT_TYPES(cls):
-        checkpoints = folder_paths.get_filename_list("checkpoints")
+        checkpoints = get_combined_model_list()
         default_folder = ""
         checkpoint_folders = folder_paths.get_folder_paths("checkpoints")
         if checkpoint_folders:
@@ -387,7 +389,7 @@ class EasyComponentExtractor:
         elif checkpoint != "None" and checkpoint:
             # ── Branch 2: File path via _LazyCheckpointMapping (P2: mmap, 0 RAM) ──
             print(f"   📁 Loading checkpoint: {checkpoint}")
-            ckpt_path = folder_paths.get_full_path("checkpoints", checkpoint)
+            ckpt_path = resolve_model_path(checkpoint)
             if ckpt_path is None:
                 print(f"   ❌ Checkpoint not found: {checkpoint}")
                 return (None, None, None, None, None, None, "", "", "")

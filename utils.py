@@ -1022,6 +1022,56 @@ def get_checkpoint_output_path(save_folder: str, filename: str) -> Path:
     return _get_output_path(save_folder, filename, "merged_checkpoint", "checkpoints")
 
 
+# ── Combined model list + path resolution for UNet/checkpoint support ──
+# These functions allow nodes to show BOTH checkpoints and diffusion models
+# (UNets) in their dropdown lists, resolving paths from either folder type.
+# Diffusion models from models/unet/ and models/diffusion_models/ are appended
+# to the checkpoint list, with deduplication. When resolving paths, checkpoints
+# are tried first, then diffusion_models as fallback.
+
+def get_combined_model_list() -> List[str]:
+    """Return a combined, deduplicated list of filenames from both
+    ``checkpoints`` and ``diffusion_models`` ComfyUI folder types.
+
+    Checkpoint files come first; diffusion model files that are not already
+    in the checkpoint list are appended at the end.  This prevents duplicate
+    entries when the same filename exists in both ``models/checkpoints/`` and
+    ``models/unet/``.
+
+    Returns:
+        List of filename strings suitable for use in ComfyUI dropdowns.
+    """
+    checkpoints = folder_paths.get_filename_list("checkpoints")
+    diffusion_models = folder_paths.get_filename_list("diffusion_models")
+    seen = set(checkpoints)
+    for model in diffusion_models:
+        if model not in seen:
+            checkpoints.append(model)
+            seen.add(model)
+    return checkpoints
+
+
+def resolve_model_path(name: str) -> Optional[str]:
+    """Resolve a model filename to its full filesystem path.
+
+    Tries the ``checkpoints`` folder first, then falls back to
+    ``diffusion_models``.  This gives priority to checkpoint paths when
+    the same filename exists in both directories.
+
+    Args:
+        name: Filename (e.g. ``"my_model.safetensors"``) or ``"None"``.
+
+    Returns:
+        Full path string if found in either folder, or ``None`` if not found.
+    """
+    if not name or name == "None":
+        return None
+    path = folder_paths.get_full_path("checkpoints", name)
+    if path is not None:
+        return path
+    return folder_paths.get_full_path("diffusion_models", name)
+
+
 # ── Streaming safetensors writer (avoids BytesIO 2× memory spike) ──
 
 _DTYPE_SIZE = {

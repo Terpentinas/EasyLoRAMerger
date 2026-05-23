@@ -144,4 +144,76 @@ The suite is engineered for stability and SSD-friendly operation:
 
 ---
 
+# 💾 Saving Your Merged Models
+
+Every node with save capability exposes three controls: **`save_trigger`**, **`save_folder`**, and **`filename`**.
+
+### How `save_trigger` Works
+
+| Toggle | Behavior |
+|--------|----------|
+| `False` (default) | **Preview mode** — merge runs, MODEL+CLIP+VAE outputs are returned for testing, but **no file is written to disk**. |
+| `True` | **Save mode** — result is written to a `.safetensors` file, then loaded from that file (or RAM) for downstream use. |
+
+> 💡 Start with `save_trigger=False` to test your merge settings. Toggle it to `True` only when you're happy with the result.
+
+### Save Locations
+
+- **Checkpoint nodes** (Checkpoint Merger, Baker) → `ComfyUI/models/checkpoints/`
+- **LoRA nodes** (LoRA Merger, LoRA Studio) → `ComfyUI/models/loras/`
+
+You can override the location with `save_folder`:
+
+| `save_folder` value | Example | Where it saves |
+|--------------------|---------|---------------|
+| Empty | `""` | ComfyUI default folder |
+| Relative path | `"my_merges"` | `default/my_merges/merged.safetensors` |
+| Absolute path | `"D:\\ModelMerges"` | `D:/ModelMerges/merged.safetensors` |
+
+### Filename & Auto-Increment
+
+The `filename` parameter sets the output name (`.safetensors` is appended automatically).
+
+If a file with that name already exists, most nodes auto-increment:
+- `merged_checkpoint` → `merged_checkpoint_1` → `merged_checkpoint_2` ...
+- `triple_merged` → `triple_merged_1` → `triple_merged_2` ...
+
+> ℹ️ **Studio & Converter nodes** (Checkpoint Studio, LoRA Studio) add `_converted` before the extension: `name_converted.safetensors`, `name_converted_1.safetensors`.
+
+---
+
+# ⚖️ Weight Guidance
+
+The **global weights** (`weight_a`, `weight_b`, `weight_c`) multiply with **component weights** (`weight_unet`, `weight_clip`, `weight_vae`, `weight_te`) to determine the effective strength per component.
+
+### Key Insight: Checkpoints vs LoRAs
+
+| Type | What the weights multiply | Guidance |
+|------|--------------------------|----------|
+| **Checkpoints** | Absolute weight values (large, ~1.0 scale) | **For `linear`**: weights should sum close to 1.0 (e.g., `0.5 + 0.5`, `0.7 + 0.3`). With `1.0 + 1.0` the output becomes `A + B` — doubling magnitudes, resulting in noise. |
+| **LoRAs** | Small delta values (≈1e‑3 scale) | Weights are independent — feel free to experiment. LoRAs are fast to iterate on. |
+
+### General Approach
+
+1. **Start with equal weights** — `0.5 + 0.5` for checkpoints, `1.0 + 1.0` for LoRAs.
+2. **Use `save_trigger=False`** (preview mode) to test without cluttering your disk.
+3. **Adjust one weight at a time** — small increments (0.05–0.1) and see how the output changes.
+4. **Different architectures** (Flux, SDXL, SD1.5, Z‑Image) may respond differently to the same weights — trust your eyes.
+
+### Per-Method Notes
+
+| Method | Weight behavior |
+|--------|---------------|
+| **`linear`** | Direct weighted sum. For checkpoints: `result = A×wa + B×wb` — sum should be ≈1.0. For LoRAs: any values work. |
+| **`feature_mix`** | Preserves unique features per-element. `1.0 + 1.0` is fine — not additive. |
+| **`magnitude`** | Takes the larger signal per-element from either source. `1.0 + 1.0` is fine. |
+| **`slerp`** | Uses `\|weight\|` as interpolation factor. Sign is discarded. |
+| **`subtract`** | `wa` controls source strength, `wb` controls how much of B to remove. |
+| **`ties_*`** | Sign-based. Limited effect on all-positive checkpoint weights. |
+| **`dare_*`** | Uses `density` for sparsification, not weight sum. Risky on checkpoints. |
+
+> 💡 **The best weights depend on your models and goal.** These are starting points, not rules. The suite is designed for exploration — iterate and find what works for your specific combination.
+
+---
+
 *Built because merging different model formats shouldn't require a PhD in tensor math.* 💪

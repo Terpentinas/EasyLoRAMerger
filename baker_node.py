@@ -33,6 +33,8 @@ from .utils import (
     save_safetensors_stream,
     load_state_dict_as_model_objects,
     get_available_ram,
+    get_combined_model_list,
+    resolve_model_path,
 )
 from .config import PRECISION_EXTENDED, DEVICE_OPTIONS, DevicePrecisionConfig
 from .engine.baking_processor import SmartBakingProcessor
@@ -120,7 +122,7 @@ class SmartModelBaker:
     
     @classmethod
     def INPUT_TYPES(cls):
-        checkpoints = folder_paths.get_filename_list("checkpoints")
+        checkpoints = get_combined_model_list()
         loras = folder_paths.get_filename_list("loras")
         return {
             "required": {},
@@ -289,7 +291,7 @@ class SmartModelBaker:
         # ------------------------------------------------------------------
         print("\n📥 Loading checkpoint...")
         try:
-            ckpt_path = folder_paths.get_full_path("checkpoints", checkpoint)
+            ckpt_path = resolve_model_path(checkpoint)
             if not ckpt_path:
                 # Try direct path
                 ckpt_path = checkpoint

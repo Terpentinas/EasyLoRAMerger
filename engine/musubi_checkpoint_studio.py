@@ -36,6 +36,8 @@ try:
         print_ram_delta,
         memory_guard,
         read_safetensors_header_only,
+        get_combined_model_list,
+        resolve_model_path,
     )
 except ImportError:
     from config import PRECISION_STUDIO, DEVICE_OPTIONS, FORMAT_OPTIONS
@@ -54,6 +56,8 @@ except ImportError:
         print_ram_delta,
         memory_guard,
         read_safetensors_header_only,
+        get_combined_model_list,
+        resolve_model_path,
     )
 
 # FP8 quantization — shared module (single source of truth)
@@ -129,8 +133,8 @@ class MusubiCheckpointStudio:
 
     @classmethod
     def INPUT_TYPES(cls):
-        # Get list of checkpoints from ComfyUI's folder paths
-        checkpoints = folder_paths.get_filename_list("checkpoints")
+        # Get combined list of checkpoints + diffusion models (UNets)
+        checkpoints = get_combined_model_list()
         default_folder = ""
         checkpoint_folders = folder_paths.get_folder_paths("checkpoints")
         if checkpoint_folders:
@@ -1687,7 +1691,7 @@ class MusubiCheckpointStudio:
             if checkpoint == "None" or not checkpoint:
                 print("❌ No checkpoint input provided")
                 return (None, None, None, None, "", "No input")
-            path = folder_paths.get_full_path("checkpoints", checkpoint)
+            path = resolve_model_path(checkpoint)
             if path is None:
                 print(f"❌ Checkpoint file not found: {checkpoint}")
                 return (None, None, None, None, "", "File not found")

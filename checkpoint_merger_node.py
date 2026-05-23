@@ -26,6 +26,8 @@ from .utils import (
     get_available_ram,
     get_free_disk_space,
     ProgressTracker,
+    get_combined_model_list,
+    resolve_model_path,
 )
 from .config import PRECISION_EXTENDED, DEVICE_OPTIONS
 from .engine.methods import resolve_blend_mode_triple
@@ -51,7 +53,7 @@ class EasyCheckpointMerger:
     
     @classmethod
     def INPUT_TYPES(cls):
-        checkpoints = folder_paths.get_filename_list("checkpoints")
+        checkpoints = get_combined_model_list()
         default_folder = ""
         checkpoint_folders = folder_paths.get_folder_paths("checkpoints")
         if checkpoint_folders:
@@ -98,11 +100,11 @@ class EasyCheckpointMerger:
                 "checkpoint_data_b": ("CHECKPOINT",),
                 "checkpoint_data_c": ("CHECKPOINT",),
                 "weight_a": ("FLOAT", {"default": 1.0, "min": -5.0, "max": 5.0, "step": 0.05,
-                                       "tooltip": "Global strength of first checkpoint"}),
+                                       "tooltip": "Global strength of first checkpoint. For linear method: weights should sum close to 1.0 (e.g., 0.5+0.5) to avoid doubling magnitudes — 1.0+1.0 produces noise."}),
                 "weight_b": ("FLOAT", {"default": 1.0, "min": -5.0, "max": 5.0, "step": 0.05,
-                                       "tooltip": "Global strength of second checkpoint"}),
+                                       "tooltip": "Global strength of second checkpoint. For linear method: weights should sum close to 1.0 (e.g., 0.5+0.5) to avoid doubling magnitudes — 1.0+1.0 produces noise."}),
                 "weight_c": ("FLOAT", {"default": 1.0, "min": -5.0, "max": 5.0, "step": 0.05,
-                                       "tooltip": "Global strength of third checkpoint"}),
+                                       "tooltip": "Global strength of third checkpoint. For linear method: weights should sum close to 1.0 (e.g., 0.5+0.5) to avoid doubling magnitudes — 1.0+1.0 produces noise."}),
                 "weight_unet": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
                                           "tooltip": "Component scaling for UNET weights"}),
                 "weight_clip": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.05,
@@ -255,7 +257,7 @@ class EasyCheckpointMerger:
                 source_dicts.append(data)
                 weights.append(weight)
             elif dropdown != "None" and dropdown:
-                full_path = folder_paths.get_full_path("checkpoints", dropdown)
+                full_path = resolve_model_path(dropdown)
                 if full_path is None:
                     raise ValueError(f"Checkpoint {name} not found: {dropdown}")
                 source_paths.append(Path(full_path))
