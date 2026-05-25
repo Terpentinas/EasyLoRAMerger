@@ -94,7 +94,7 @@ GGUF_QTYPE_LABELS = {
 }
 
 # File type for LlamaFileType metadata
-_GGUF_QTYPE_TO_FILE_TYPE = {
+_GGUF_QTYPE_TO_FILE_TYPE = {} if gguf is None else {
     gguf.GGMLQuantizationType.Q8_0: gguf.LlamaFileType.MOSTLY_Q8_0,
     gguf.GGMLQuantizationType.Q5_0: gguf.LlamaFileType.MOSTLY_Q5_0,
     gguf.GGMLQuantizationType.Q4_0: gguf.LlamaFileType.MOSTLY_Q4_0,

@@ -308,11 +308,15 @@ _ARCH_KEY_RULES: Dict[str, Dict] = {
     },
     # ── Anima ────────────────────────────────────────────────────────────
     # Anima: net.blocks.xxx → diffusion_model.blocks.xxx
+    # After checkpoint_normalizer strips "net." prefix, keys are bare
+    # blocks.xxx. The bare_paths rule catches these normalized keys.
     "anima": {
         "checkpoint_prefixes": [
             ("net.blocks.", "diffusion_model.blocks."),
         ],
-        "bare_paths": [],
+        "bare_paths": [
+            "blocks.",  # normalized bare blocks.* → diffusion_model.blocks.*
+        ],
         "lora_prefix": "diffusion_model.",
     },
     # ── Additional TE/CLIP prefix patterns ───────────────────────────────

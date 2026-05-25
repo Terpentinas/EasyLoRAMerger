@@ -92,6 +92,7 @@ Console output keeps you informed at every step without overwhelming.
 - **Install:** Drop into `ComfyUI/custom_nodes/` and restart ComfyUI.
 - **Explore:** Drag [`assets/nodes.png`](assets/nodes.png) into the workflow area to see the suite in action.
 - **Experiment:** Connect a *Easy LoRA Merger* → *Easy LoRA Baker* pipeline, or use *Easy Checkpoint Studio* to shrink a 12GB checkpoint to FP8.
+- **Optional — GGUF export:** Install `pip install gguf` to enable GGUF output format in Easy Checkpoint Studio. GGUF files are loaded with the [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) custom node. All other Easy LoRA Merger nodes work without either dependency.
 - **Feedback:** Open an issue on GitHub — contributions and ideas welcome.
 
 ---
@@ -128,8 +129,11 @@ Used by: **Easy Checkpoint Studio**
 | `int8` | Explicit INT8 quantization, 1 byte/param |
 | `int8_convrot` | INT8 with convolution rotation handling |
 | `svd_only` | SVD compression only, no dtype conversion |
+| `gguf_q8_0` / `gguf_q5_0` / `gguf_q4_0` | Block‑wise GGUF quantization — requires `gguf` Python package (`pip install gguf`). Output loads with [ComfyUI-GGUF](https://github.com/city96/ComfyUI-GGUF) nodes. |
 
 > 💡 **Tip:** For everyday use, just leave it on `auto`. The nodes will pick the best format for your hardware automatically.
+>
+> ⚠️ **Note:** The `gguf` package is **optional**. All nodes work without it — GGUF output is only available in Easy Checkpoint Studio when `gguf` is installed. If missing, GGUF options are hidden from the dropdown and the Checkpoint Studio loads gracefully without them.
 
 ---
 

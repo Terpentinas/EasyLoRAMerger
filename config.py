@@ -97,10 +97,21 @@ PRECISION_STUDIO = PRECISION_EXTENDED + ["int8", "int8_convrot", "svd_only"]
 
 DEVICE_OPTIONS = ["auto", "cuda", "cpu"]
 
+# ── GGUF availability check ────────────────────────────────────────────────
+# If 'gguf' is not installed, hide GGUF format options from the UI dropdown
+# to prevent users from selecting options that will fail at runtime.
+try:
+    import gguf  # noqa: F401 — just checking availability
+    _GGUF_AVAILABLE = True
+except ImportError:
+    _GGUF_AVAILABLE = False
+
 # GGUF output format options for Checkpoint Studio.
 # Each entry maps to a GGMLQuantizationType in engine/gguf_writer.py.
 # "safetensors" retains the existing output path (FP8/BF16/INT8 safetensors file).
-FORMAT_OPTIONS = ["safetensors", "gguf_q8_0", "gguf_q5_0", "gguf_q4_0"]
+FORMAT_OPTIONS = ["safetensors"] + (
+    ["gguf_q8_0", "gguf_q5_0", "gguf_q4_0"] if _GGUF_AVAILABLE else []
+)
 
 
 # ── Unified device/precision resolver ──

@@ -28,10 +28,18 @@ CHECKPOINT_ARCHITECTURES = {
             ["net.blocks"],
             # Also detect by net.final_layer as secondary marker
             ["net.final_layer"],
+            # Detect bare blocks.* keys without net. prefix (common in fine-tuned
+            # checkpoints). Uses AND logic: both "blocks." and "adaln_modulation"
+            # must exist in the keyset. "blocks." alone would also match SDXL's
+            # input_blocks.* / output_blocks.* and Flux's double_blocks.*, so
+            # "adaln_modulation" narrows it to Anima-specific key patterns.
+            ["blocks.", "adaln_modulation"],
         ],
-        "strip_prefixes": [],
-        "canonical_form": "with net. prefix — keys like net.blocks.0.adaln_modulation_cross_attn.1.weight",
-        "description": "Anima / Anime Diffusion (FLOW-based model with net.blocks architecture)",
+        # Strip "net." prefix so that net.blocks.* and bare blocks.* keys
+        # normalize to the same canonical form for matching.
+        "strip_prefixes": ["net."],
+        "canonical_form": "bare blocks. prefix — keys like blocks.0.adaln_modulation_cross_attn.1.weight",
+        "description": "Anima / Anime Diffusion (FLOW-based model with blocks architecture)",
     },
     "flux": {
         "detect": ["double_blocks", "single_blocks"],

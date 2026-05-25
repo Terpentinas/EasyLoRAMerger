@@ -1,4 +1,7 @@
 import { app } from "../../scripts/app.js";
+import { ComfyWidgets } from "../../scripts/widgets.js";
+
+console.log("[EasyLoRAMerger] JS module loaded — registering extensions", Date.now());
 
 // Enhanced method descriptions
 const METHOD_DESCRIPTIONS = {
@@ -209,4 +212,125 @@ app.registerExtension({
             };
         }
     }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// EasyTextDisplay — renders STRING input as a visible multiline widget
+//
+// Pattern follows proven ShowText (comfyui-custom-scripts) implementation:
+//   1. Determine if there's a hidden converted-widget; clear from there
+//   2. Create read-only widgets named "text_N" via ComfyWidgets
+//   3. On execution: onExecuted → populate(message.text)
+//   4. On workflow load: configure → store values, onConfigure → restore
+// ═══════════════════════════════════════════════════════════════════════
+app.registerExtension({
+	name: "EasyLoRA.TextDisplay",
+	async beforeRegisterNodeDef(nodeType, nodeData, app) {
+		if (nodeData.name === "EasyTextDisplay") {
+			console.log("[EasyLoRA.TextDisplay] Registering for EasyTextDisplay node");
+
+			/**
+			 * Populate the node with read-only display widgets
+			 * from the given text array.
+			 *
+			 * @param {string[]} text — e.g. ["hello world"]
+			 */
+			function populate(text) {
+				try {
+					if (this.widgets) {
+						// On older frontend versions there is a hidden converted-widget
+						const isConvertedWidget = +!!this.inputs?.[0]?.widget;
+						for (let i = isConvertedWidget; i < this.widgets.length; i++) {
+							this.widgets[i].onRemove?.();
+						}
+						this.widgets.length = isConvertedWidget;
+					}
+
+					// Guard: if text is undefined/null, there's nothing to display
+					if (text == null) {
+						console.warn("[EasyLoRA.TextDisplay] populate called with null/undefined text");
+						return;
+					}
+
+					const v = [...text];
+					if (!v[0]) {
+						v.shift();
+					}
+					for (let list of v) {
+						// Force list to be an array, not sure why sometimes it is/isn't
+						if (!(list instanceof Array)) list = [list];
+						for (const l of list) {
+							const w = ComfyWidgets["STRING"](
+								this,
+								"text_" + (this.widgets?.length ?? 0),
+								["STRING", { multiline: true }],
+								app
+							).widget;
+							w.inputEl.readOnly = true;
+							w.inputEl.style.opacity = 0.6;
+							w.value = l;
+						}
+					}
+
+					// Auto-resize to fit content
+					requestAnimationFrame(() => {
+						const sz = this.computeSize();
+						if (sz[0] < this.size[0]) sz[0] = this.size[0];
+						if (sz[1] < this.size[1]) sz[1] = this.size[1];
+						this.onResize?.(sz);
+						app.graph.setDirtyCanvas(true, false);
+					});
+				} catch (err) {
+					console.error("[EasyLoRA.TextDisplay] populate() crashed:", err);
+				}
+			}
+
+			// ── onExecuted: triggered when the node finishes running ──
+			const onExecuted = nodeType.prototype.onExecuted;
+			nodeType.prototype.onExecuted = function (message) {
+				try {
+					onExecuted?.apply(this, arguments);
+					console.log("[EasyLoRA.TextDisplay] onExecuted received:", JSON.stringify(message));
+					populate.call(this, message?.text);
+				} catch (err) {
+					console.error("[EasyLoRA.TextDisplay] onExecuted crashed:", err);
+				}
+			};
+
+			// ── Persist text across workflow saves/loads ──
+			const VALUES = Symbol("textDisplayValues");
+			const configure = nodeType.prototype.configure;
+			nodeType.prototype.configure = function () {
+				// Store unmodified widget values as they get removed on configure by new frontend
+				this[VALUES] = arguments[0]?.widgets_values;
+				return configure?.apply(this, arguments);
+			};
+
+			const onConfigure = nodeType.prototype.onConfigure;
+			nodeType.prototype.onConfigure = function () {
+				try {
+					onConfigure?.apply(this, arguments);
+					const widgets_values = this[VALUES];
+					if (widgets_values?.length) {
+						console.log("[EasyLoRA.TextDisplay] onConfigure restoring:", JSON.stringify(widgets_values));
+						// In newer frontend there seems to be a delay in creating the initial widget
+						requestAnimationFrame(() => {
+							try {
+								populate.call(
+									this,
+									widgets_values.slice(
+										+(widgets_values.length > 1 && this.inputs?.[0]?.widget)
+									)
+								);
+							} catch (err) {
+								console.error("[EasyLoRA.TextDisplay] onConfigure populate crashed:", err);
+							}
+						});
+					}
+				} catch (err) {
+					console.error("[EasyLoRA.TextDisplay] onConfigure crashed:", err);
+				}
+			};
+		}
+	},
 });

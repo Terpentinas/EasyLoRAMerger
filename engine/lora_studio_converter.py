@@ -24,6 +24,8 @@ from ..utils import (
     categorize_key,
     DeviceManager,
     ProgressTracker,
+    comfyui_yield,
+    cleanup_memory,
 )
 from .klein_normalizer import (
     detect_lora_format,
@@ -193,9 +195,16 @@ class MusubiLoraConverter:
         key_str = str(cache_key).encode('utf-8')
         return hashlib.md5(key_str).hexdigest()
 
-    def _apply_svd_compression(self, normalized_sd, compression_mode, target_rank):
+    def _apply_svd_compression(self, normalized_sd, compression_mode, target_rank, device=None):
         """
-        Apply SVD compression to normalized state dict.
+        Apply SVD compression to normalized state dict using batched SVD.
+        
+        LoRA layers within a model architecture typically share dimensions
+        (e.g., all DiT blocks have QKV projections of the same size).
+        We group pairs by (out_features, in_features) and call
+        torch.linalg.svd once per group with a batched 3D tensor,
+        dramatically reducing GPU kernel launch overhead.
+        
         Returns (compressed_sd, compression_info) where compression_info dict contains:
             - compression_mode
             - original_total_params
@@ -235,137 +244,223 @@ class MusubiLoraConverter:
         layer_count = 0
         skipped_conv = 0
         
-        # Progress indicator — replace 10% console with ComfyUI ProgressBar
-        total_pairs = len(pairs)
-        with ProgressTracker(total=total_pairs, desc="[SVD] Processing layers") as svd_progress:
+        # ================================================================
+        # PHASE 1: Analyze all pairs, detect orientation, group by shape
+        # ================================================================
+        # Groups are keyed by (out_features, in_features) — pairs sharing
+        # identical matrix dimensions are processed together in one batched
+        # SVD call, which is dramatically faster than one-by-one on GPU.
+        shape_groups = {}       # {(out, in): [(dk, uk, base, transposed, rank), ...]}
+        conv_pairs = []         # handled separately (no SVD)
+        skipped_mismatch = []   # rank mismatch warnings
         
-            for i, (dk, uk, base) in enumerate(pairs):
-                down = compressed_sd[dk]
-                up = compressed_sd[uk]
+        for dk, uk, base in pairs:
+            down = compressed_sd[dk]
+            up = compressed_sd[uk]
 
-                # Skip convolutional layers (spatial dimensions >2) to avoid shape errors
-                if down.ndim > 2 or up.ndim > 2:
-                    skipped_conv += 1
-                    print(f"ℹ️ Skipping convolutional layer {base} (shape {down.shape}, {up.shape})")
-                    # Ensure tensors are contiguous for safetensors
-                    if not down.is_contiguous():
-                        compressed_sd[dk] = down.contiguous()
-                    if not up.is_contiguous():
-                        compressed_sd[uk] = up.contiguous()
-                    continue
+            # Skip convolutional layers (spatial dimensions >2) to avoid shape errors
+            if down.ndim > 2 or up.ndim > 2:
+                conv_pairs.append((dk, uk, base))
+                # Ensure tensors are contiguous for safetensors
+                if not down.is_contiguous():
+                    compressed_sd[dk] = down.contiguous()
+                if not up.is_contiguous():
+                    compressed_sd[uk] = up.contiguous()
+                continue
 
-                # Detect orientation: down shape (out_features, rank) or (rank, out_features)
-                transposed = False
-                # Check both possible orientations (ambiguous if both conditions hold)
-                if down.shape[1] == up.shape[0] and down.shape[0] == up.shape[1]:
-                    # Both orientations possible (square matrices). Decide based on typical LoRA rank being smaller dimension.
-                    # Standard orientation: rank = down.shape[1], out_features = down.shape[0], in_features = up.shape[1]
-                    # Transposed orientation: rank = down.shape[0], out_features = down.shape[1], in_features = up.shape[0]
-                    rank_standard = down.shape[1]
-                    rank_transposed = down.shape[0]
-                    # Choose orientation where rank is smaller than out_features and in_features (typical LoRA)
-                    # If both satisfy, prefer standard orientation.
-                    if rank_standard < down.shape[0] and rank_standard < up.shape[1]:
-                        # standard orientation is correct
-                        out_features, rank = down.shape
-                        rank2, in_features = up.shape
-                    else:
-                        # transposed orientation is correct
-                        down = down.T
-                        up = up.T
-                        out_features, rank = down.shape
-                        rank2, in_features = up.shape
-                        transposed = True
-                elif down.shape[1] == up.shape[0]:
-                    # standard orientation: down (out_features, rank), up (rank, in_features)
+            # Detect orientation: down shape (out_features, rank) or (rank, out_features)
+            transposed = False
+            if down.shape[1] == up.shape[0] and down.shape[0] == up.shape[1]:
+                # Both orientations possible (square matrices). Decide based on typical LoRA rank being smaller dimension.
+                rank_standard = down.shape[1]
+                if rank_standard < down.shape[0] and rank_standard < up.shape[1]:
                     out_features, rank = down.shape
                     rank2, in_features = up.shape
-                elif down.shape[0] == up.shape[1]:
-                    # transposed orientation: down (rank, out_features), up (in_features, rank)
-                    # transpose to standard orientation for processing
-                    down = down.T
-                    up = up.T
-                    out_features, rank = down.shape
-                    rank2, in_features = up.shape
+                else:
+                    out_features, rank = down.T.shape
+                    rank2, in_features = up.T.shape
                     transposed = True
-                else:
-                    # mismatch, skip this pair with warning
-                    print(f"⚠️ Rank mismatch {down.shape} vs {up.shape} for pair {dk}, {uk}; skipping")
-                    continue
-                assert rank == rank2, f"Rank mismatch {rank} != {rank2} for pair {dk}, {uk}"
-                
-                # Compute product W = down @ up  (out_features, in_features)
-                W = down.float() @ up.float()
-                
-                # SVD
-                max_singular_values = min(out_features, in_features)
-                if compression_mode in ('auto-fast', 'manual'):
+            elif down.shape[1] == up.shape[0]:
+                out_features, rank = down.shape
+                rank2, in_features = up.shape
+            elif down.shape[0] == up.shape[1]:
+                out_features, rank = down.T.shape
+                rank2, in_features = up.T.shape
+                transposed = True
+            else:
+                skipped_mismatch.append((dk, uk, base))
+                continue
+
+            assert rank == rank2, f"Rank mismatch {rank} != {rank2} for pair {dk}, {uk}"
+
+            # Group by (out_features, in_features) for batched SVD
+            shape_key = (out_features, in_features)
+            if shape_key not in shape_groups:
+                shape_groups[shape_key] = []
+            shape_groups[shape_key].append((dk, uk, base, transposed, rank))
+
+        if skipped_mismatch:
+            for dk, uk, base in skipped_mismatch:
+                print(f"⚠️ Rank mismatch for pair {dk}, {uk}; skipping")
+
+        # ================================================================
+        # PHASE 2: Micro-batched SVD per shape group
+        # ================================================================
+        # Large shape groups (e.g., 105 identical QKV projections in DiT models)
+        # produce W = down @ up matrices of size (out_features, in_features).
+        # For 4096×4096 W, stacking ALL 105 into one W_batch would consume
+        # ~7 GB + SVD intermediates — exceeding most consumer GPUs.
+        #
+        # Instead, process in micro-batches of SVD_MICRO_BATCH pairs each.
+        # This caps peak VRAM while still amortizing kernel launch overhead.
+        SVD_MICRO_BATCH = 8  # pairs per batched SVD call
+        total_pairs = len(pairs)
+
+        with ProgressTracker(total=total_pairs, desc="[SVD] Processing layers") as svd_progress:
+
+            for (out_features, in_features), group in shape_groups.items():
+                group_size = len(group)
+
+                # Process this shape group in micro-batches to cap peak VRAM
+                for start_idx in range(0, group_size, SVD_MICRO_BATCH):
+                    micro_batch = group[start_idx:start_idx + SVD_MICRO_BATCH]
+                    mb_size = len(micro_batch)
+
+                    # ── Step 1: Compute W matrices for this micro-batch ──
+                    W_list = []
+                    for dk, uk, base, transposed, rank in micro_batch:
+                        down = compressed_sd[dk]
+                        up = compressed_sd[uk]
+
+                        # On-demand GPU transfer (lazy, per-pair)
+                        down_on_gpu = False
+                        up_on_gpu = False
+                        if device is not None and down.device != device:
+                            down = down.to(device=device)
+                            down_on_gpu = True
+                        if device is not None and up.device != device:
+                            up = up.to(device=device)
+                            up_on_gpu = True
+
+                        if transposed:
+                            W = down.T.float() @ up.T.float()
+                        else:
+                            W = down.float() @ up.float()
+
+                        # Free GPU copies of down/up immediately — no longer needed
+                        if down_on_gpu:
+                            del down
+                        if up_on_gpu:
+                            del up
+
+                        W_list.append(W)
+
+                    # ── Step 2: Batched SVD for this micro-batch ──
                     if compression_mode == 'auto-fast':
-                        # randomized low-rank SVD (fast): compute up to original rank
-                        q = min(rank, max_singular_values)
+                        # Randomized SVD (fast): compute only top-q singular values.
+                        # For LoRA, W = down @ up has rank <= training rank.
+                        # q = rank + 10 oversampling ensures >99.9% energy capture.
+                        pair_rank = micro_batch[0][4]  # original training rank
+                        q = min(pair_rank + 10, out_features, in_features)
+                        q = max(q, 1)
+                        if mb_size == 1:
+                            W = W_list[0]
+                            U, S, V = torch.svd_lowrank(W, q=q)
+                            Vh = V.mT  # svd_lowrank returns V; convert to Vh convention
+                            U_batch, S_batch, Vh_batch = U.unsqueeze(0), S.unsqueeze(0), Vh.unsqueeze(0)
+                            del W
+                        else:
+                            W_batch = torch.stack(W_list, dim=0)
+                            del W_list
+                            U_batch, S_batch, V_batch = torch.svd_lowrank(W_batch, q=q)
+                            Vh_batch = V_batch.mT  # convert to Vh convention
+                            del W_batch
                     else:
-                        # manual target rank: ensure we capture at least target_rank singular values
-                        q = min(max(rank, target_rank), max_singular_values)
-                    q = max(q, 1)
-                    U, S, V = torch.svd_lowrank(W, q=q, niter=4)
-                    Vh = V.T  # convert to (q, n) format consistent with linalg.svd
-                else:
-                    # auto-full, original, or other (full SVD)
-                    U, S, Vh = torch.linalg.svd(W, full_matrices=False)
-                
-                # Determine target rank
-                if compression_mode == 'original':
-                    k = rank
-                elif compression_mode == 'manual':
-                    k = min(target_rank, rank)
-                    k = max(k, 1)
-                else:  # auto-fast or auto-full
-                    # compute cumulative energy
-                    total_energy = torch.sum(S ** 2)
-                    cumulative = torch.cumsum(S ** 2, dim=0)
-                    # find smallest k where cumulative >= 0.95 * total_energy
-                    k = torch.searchsorted(cumulative, 0.95 * total_energy).item() + 1
-                    k = min(k, rank)
-                    k = max(k, 1)
-                
-                # Truncate and re‑factorize
-                sqrt_Sk = torch.sqrt(S[:k])
-                down_new = (U[:, :k] * sqrt_Sk).contiguous()  # (out_features, k)
-                up_new = (sqrt_Sk[:, None] * Vh[:k, :]).contiguous()  # (k, in_features)
-                # Cast back to original dtype
-                down_new = down_new.to(dtype=down.dtype)
-                up_new = up_new.to(dtype=up.dtype)
-                
-                # Update state dict
-                if transposed:
-                    down_new = down_new.T.contiguous()
-                    up_new = up_new.T.contiguous()
-                compressed_sd[dk] = down_new
-                compressed_sd[uk] = up_new
-                
-                # Update alpha if present
-                alpha_key = f"{base}.alpha"
-                if alpha_key in compressed_sd:
-                    alpha = compressed_sd[alpha_key]
-                    # Alpha scaling formula: new_alpha = old_alpha * (k / rank)
-                    # Alpha may be scalar tensor or float; ensure tensor
-                    alpha = alpha * (k / rank)
-                    compressed_sd[alpha_key] = alpha
-                
-                # Statistics
-                total_original_params += out_features * rank + rank * in_features
-                total_compressed_params += out_features * k + k * in_features
-                rank_sum += k
-                layer_count += 1
+                        # Exact SVD (auto-full, original, manual)
+                        if mb_size == 1:
+                            W = W_list[0]
+                            U, S, Vh = torch.linalg.svd(W, full_matrices=False)
+                            U_batch, S_batch, Vh_batch = U.unsqueeze(0), S.unsqueeze(0), Vh.unsqueeze(0)
+                            del W  # free single W immediately
+                        else:
+                            W_batch = torch.stack(W_list, dim=0)  # (B, M, N)
+                            del W_list  # free list before SVD to save memory
+                            U_batch, S_batch, Vh_batch = torch.linalg.svd(W_batch, full_matrices=False)
+                            del W_batch  # free stacked W immediately after SVD
+
+                    # ── Step 3: Process results (truncate and refactorize) ──
+                    for i, (dk, uk, base, transposed, rank) in enumerate(micro_batch):
+                        S = S_batch[i]
+                        U = U_batch[i]
+                        Vh = Vh_batch[i]
+
+                        # Determine target rank
+                        if compression_mode == 'original':
+                            k = rank
+                        elif compression_mode == 'manual':
+                            k = min(target_rank, rank)
+                            k = max(k, 1)
+                        else:  # auto-fast or auto-full (same 95% energy threshold)
+                            total_energy = torch.sum(S ** 2)
+                            cumulative = torch.cumsum(S ** 2, dim=0)
+                            k = torch.searchsorted(cumulative, 0.95 * total_energy).item() + 1
+                            k = min(k, rank)
+                            k = max(k, 1)
+
+                        # Truncate and re-factorize
+                        sqrt_Sk = torch.sqrt(S[:k])
+                        down_new = (U[:, :k] * sqrt_Sk).contiguous()  # (out_features, k)
+                        up_new = (sqrt_Sk[:, None] * Vh[:k, :]).contiguous()  # (k, in_features)
+
+                        # Cast back to original dtype
+                        down_dtype = compressed_sd[dk].dtype
+                        up_dtype = compressed_sd[uk].dtype
+                        down_new = down_new.to(dtype=down_dtype)
+                        up_new = up_new.to(dtype=up_dtype)
+
+                        if transposed:
+                            down_new = down_new.T.contiguous()
+                            up_new = up_new.T.contiguous()
+
+                        compressed_sd[dk] = down_new
+                        compressed_sd[uk] = up_new
+
+                        # Update alpha if present
+                        alpha_key = f"{base}.alpha"
+                        if alpha_key in compressed_sd:
+                            alpha = compressed_sd[alpha_key]
+                            alpha = alpha * (k / rank)
+                            compressed_sd[alpha_key] = alpha
+
+                        # Statistics
+                        total_original_params += out_features * rank + rank * in_features
+                        total_compressed_params += out_features * k + k * in_features
+                        rank_sum += k
+                        layer_count += 1
+                        svd_progress += 1
+
+                    # Free SVD result tensors for this micro-batch
+                    del U_batch, S_batch, Vh_batch
+
+                    # Yield to ComfyUI scheduler between micro-batches
+                    comfyui_yield()
+
+                # Clear GPU cache between shape groups
+                cleanup_memory()
+
+            # Handle convolutional pairs (no SVD, just ensure contiguous)
+            for dk, uk, base in conv_pairs:
+                skipped_conv += 1
+                print(f"ℹ️ Skipping convolutional layer {base} (shape {compressed_sd[dk].shape}, {compressed_sd[uk].shape})")
                 svd_progress += 1
 
         if skipped_conv > 0:
             print(f"ℹ️ Skipped {skipped_conv} convolutional layers (normal for SDXL/UNet).")
-        
+
         # Compute size saved (assuming float32 = 4 bytes)
         size_saved_mb = (total_original_params - total_compressed_params) * 4 / (1024 * 1024)
         avg_final_rank = rank_sum / layer_count if layer_count > 0 else 0
-        
+
         compression_info = {
             'compression_mode': compression_mode,
             'original_total_params': total_original_params,
@@ -373,7 +468,7 @@ class MusubiLoraConverter:
             'size_saved_mb': size_saved_mb,
             'final_rank': avg_final_rank,
         }
-        
+
         return compressed_sd, compression_info
 
     RETURN_TYPES = ("LORA", "MODEL", "CLIP", "STRING", "STRING")
@@ -429,21 +524,16 @@ class MusubiLoraConverter:
         """Apply SVD compression if requested. Modifies info in-place.
 
         Returns (normalized_sd, compression_info).
+        Tensors are moved to the target device on-demand inside
+        _apply_svd_compression (lazy, per-pair) instead of eagerly
+        moving all tensors upfront — reduces PCIe traffic.
         """
         target_device = DeviceManager.get_device(device)
-        if compression_mode != "original" and target_device.type != "cpu":
-            moved_count = 0
-            for k in list(normalized_sd.keys()):
-                if normalized_sd[k].device != target_device:
-                    normalized_sd[k] = normalized_sd[k].to(device=target_device)
-                    moved_count += 1
-            if moved_count > 0:
-                print(f"\U0001f527 Moved {moved_count} tensors to {target_device} for SVD compression")
 
         if compression_mode != "original":
             print(f"\U0001f527 Applying SVD compression ({compression_mode})...")
             normalized_sd, compression_info = self._apply_svd_compression(
-                normalized_sd, compression_mode, target_rank
+                normalized_sd, compression_mode, target_rank, device=target_device
             )
             info.update(compression_info)
             print(f"\U0001f527 Compression applied. Final rank: {compression_info.get('final_rank', 'N/A'):.1f}, "

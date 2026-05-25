@@ -1563,7 +1563,7 @@ def compute_component_energy_ratios(
             rank = max(1, rank)
 
             if original_sds[i] is not None:
-                from ..engine.scale_utils import find_alpha_value
+                from .engine.scale_utils import find_alpha_value
                 alpha_value = find_alpha_value(original_sds[i], key, mapping=mappings[i])
                 if not converted_flags[i] and alpha_value is not None:
                     scale_factor = alpha_value / rank
@@ -1668,7 +1668,7 @@ def compute_primary_driver_intensity_metric(
 
             # Alpha/rank scaling for unconverted LoRAs (same logic as existing functions)
             if original_sds[i] is not None:
-                from ..engine.scale_utils import find_alpha_value
+                from .engine.scale_utils import find_alpha_value
                 alpha_value = find_alpha_value(original_sds[i], key, mapping=mappings[i])
                 if not converted_flags[i] and alpha_value is not None:
                     scale_factor = alpha_value / rank

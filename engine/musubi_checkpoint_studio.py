@@ -90,12 +90,22 @@ from .svd_quantizer import (
 )
 
 # GGUF writer — block-wise quantization output for ComfyUI-GGUF
-from .gguf_writer import (
-    GGUFSaveWriter,
-    gguf_arch_from_arch,
-    is_gguf_precision,
-    GGUF_SUPPORTED_ARCHS,
-)
+# Guarded: if the 'gguf' package is not installed, GGUF features are disabled
+# but the rest of the node (precision conversion, stripping, SVD) still works.
+try:
+    from .gguf_writer import (
+        GGUFSaveWriter,
+        gguf_arch_from_arch,
+        is_gguf_precision,
+        GGUF_SUPPORTED_ARCHS,
+    )
+except ImportError:
+    GGUFSaveWriter = None
+    gguf_arch_from_arch = None  # type: ignore[assignment]
+    is_gguf_precision = lambda fmt: False  # Always returns False — clean fallback
+    GGUF_SUPPORTED_ARCHS: set = set()
+    print("⚠️ Checkpoint Studio: GGUF output disabled — 'gguf' package not installed. "
+          "Install it with: pip install gguf")
 
 try:
     from .metadata_factory import finalize_metadata
